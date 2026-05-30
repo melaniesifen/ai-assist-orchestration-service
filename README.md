@@ -27,12 +27,21 @@ Future HTTP adapters should derive `tenantId` and `userId` from authenticated id
 
 Proposed action IDs and expirations are server-owned. Callers may request a shorter TTL with `ttlMs`, but actions are capped at the 24-hour MVP maximum.
 
-## Tests
 
-Run:
+## Testing And Coverage
+
+Run the unit tests with either command:
 
 ```sh
 node --test
+npm test
 ```
 
-The test suite uses `node:test` and installs no packages.
+View the built-in coverage report in the terminal:
+
+```sh
+node --experimental-test-coverage --test
+npm run coverage
+```
+
+The coverage command uses Node's built-in test runner and prints a text report. If later tooling writes HTML, LCOV, TAP, JUnit, or build output, those generated paths are ignored by `.gitignore`.

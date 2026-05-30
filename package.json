@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Domain coordination primitives for AI Assist orchestration.",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "coverage": "node --experimental-test-coverage --test"
   },
   "engines": {
     "node": ">=20"

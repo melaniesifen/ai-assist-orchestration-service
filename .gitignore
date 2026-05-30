@@ -1,2 +1,16 @@
 prompts/
 feedback/
+node_modules/
+coverage/
+.coverage/
+.nyc_output/
+.c8/
+test-results/
+junit.xml
+tap-report/
+dist/
+build/
+out/
+.next/
+.turbo/
+*.tsbuildinfo
