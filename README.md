@@ -27,6 +27,9 @@ Future HTTP adapters should derive `tenantId` and `userId` from authenticated id
 
 Proposed action IDs and expirations are server-owned. Callers may request a shorter TTL with `ttlMs`, but actions are capped at the 24-hour MVP maximum.
 
+## Task Breakdown
+
+Implementation tasks are tracked in [TASKS.md](TASKS.md). Update the checkboxes there in the same change that implements or verifies a task.
 
 ## Testing And Coverage
 
