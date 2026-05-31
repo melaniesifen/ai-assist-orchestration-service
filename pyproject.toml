@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-assist-orchestration-service"
+version = "0.1.0"
+description = "Domain coordination primitives for AI Assist orchestration."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ai_assist_orchestration*"]

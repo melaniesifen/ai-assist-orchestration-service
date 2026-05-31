@@ -21,11 +21,17 @@ This service does not own:
 
 ## Current Implementation
 
-The package is dependency-light Node.js ESM and exports pure domain services with injected collaborators. The included in-memory action repository is for local tests and future adapter development only.
+The package is dependency-light Python and exports pure domain services with injected collaborators. Runtime code uses only the Python standard library. The included in-memory action repository is for local tests and future adapter development only.
 
 Future HTTP adapters should derive `tenantId` and `userId` from authenticated identity before calling these services. Future provider, context, connector, event, and encryption adapters should implement the injected dependency contracts without logging raw prompts, document text, model responses, secrets, or decrypted action payloads.
 
 Proposed action IDs and expirations are server-owned. Callers may request a shorter TTL with `ttlMs`, but actions are capped at the 24-hour MVP maximum.
+
+## Package Layout
+
+- `ai_assist_orchestration/`: orchestration domain package.
+- `tests/`: stdlib `unittest` coverage for command coordination and proposed-action lifecycle behavior.
+- `pyproject.toml`: Python packaging metadata with no runtime dependencies.
 
 ## Task Breakdown
 
@@ -33,18 +39,10 @@ Implementation tasks are tracked in [TASKS.md](TASKS.md). Update the checkboxes 
 
 ## Testing And Coverage
 
-Run the unit tests with either command:
+Run the unit tests:
 
 ```sh
-node --test
-npm test
+python3 -m unittest discover -s tests
 ```
 
-View the built-in coverage report in the terminal:
-
-```sh
-node --experimental-test-coverage --test
-npm run coverage
-```
-
-The coverage command uses Node's built-in test runner and prints a text report. If later tooling writes HTML, LCOV, TAP, JUnit, or build output, those generated paths are ignored by `.gitignore`.
+This repo currently has no coverage dependency. If coverage tooling is added later, keep generated reports out of git; `.gitignore` already excludes common Python and JavaScript coverage/build outputs.

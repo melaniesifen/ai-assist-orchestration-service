@@ -13,11 +13,12 @@
 - Proposed actions must be durable, TTL-bound, encrypted at storage boundaries, and scoped to tenant/user/session/resource.
 - Apply-action must be authenticated, authorized, idempotent, and conflict-safe.
 - Add tests for command validation, policy deny, provider failures, action lifecycle, duplicate apply, stale conflict no-mutation behavior, and event publication.
+- Runtime code is Python and should remain dependency-light until a production HTTP framework or adapter dependency is selected.
 
 ## Commands
 
-- Run tests with `node --test`.
-- `npm` may not be available in this environment; prefer the direct Node command.
+- Run tests with `python3 -m unittest discover -s tests`.
+- Prefer stdlib `unittest` for domain tests unless a production dependency justifies additional tooling.
 
 ## Review Notes
 

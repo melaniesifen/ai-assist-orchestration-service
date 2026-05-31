@@ -10,7 +10,7 @@ Relevant LLDs:
 - `../ai-assist-architecture/lld-session-events-transport.md`
 - `../ai-assist-architecture/lld-operations-safety.md`
 
-## Completed Local Bootstrap
+## Completed Local Bootstrap And Migration
 
 - [x] Create dependency-light Node.js ESM package for orchestration domain code.
 - [x] Implement injected command coordination across policy, context, provider, prompt, and event dependencies.
@@ -25,9 +25,12 @@ Relevant LLDs:
 - [x] Add unit tests for command coordination, policy deny, unsupported providers, action lifecycle, idempotent apply, stale conflict, concurrent apply reservation, typed validation, and safe conflict metadata.
 - [x] Document test and coverage commands in `README.md`.
 - [x] Ignore local prompts, feedback, coverage output, dependencies, and build artifacts.
+- [x] REPO-002: Migrate orchestration service to a Python package layout with equivalent command coordination, proposed-action lifecycle, policy/provider/context/event boundaries, tests, coverage workflow, and repo docs.
 
 ## Architecture Tasks Pending
 
+- Approved direction: migrate from the temporary Node.js ESM bootstrap to Python initially. Revisit Java only if long-running workflow throughput or typed domain needs justify it.
+- Migration gate: Do not continue broad new feature work until the Python migration is completed or explicitly deferred.
 - [ ] REPO-001: Decide final language, runtime, package manager, framework, package layout, migration cost, deployment target, and test strategy for this repo.
 - [ ] EVT-001: Add the HTTP command API adapter for command creation, action approval/rejection, and apply-action with server-derived identity, request IDs, correlation IDs, and idempotency keys.
 - [ ] EVT-004: Wire the injected event publisher to the session events service `SessionEvent` contract and categorize publisher failures without corrupting durable action state.
