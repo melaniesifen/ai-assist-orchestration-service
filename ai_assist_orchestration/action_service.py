@@ -93,6 +93,7 @@ class ActionService:
 
     async def approve_action(self, identity: dict, input_data: dict) -> dict:
         input_data = require_object(input_data, "input")
+        event_context = request_event_context(input_data)
         action = self._get_owned_action(identity, input_data.get("actionId"))
         require_action_status(action)
         if action["status"] == ACTION_STATUS.APPROVED.value:
@@ -110,11 +111,12 @@ class ActionService:
             patch={"status": ACTION_STATUS.APPROVED.value, "approvedAt": now, "updatedAt": now},
         )
         updated = require_transition_updated(result, "ACTION_NOT_APPROVABLE", "Action cannot be approved from its current status")
-        await self._publish_status(updated, action["status"], updated["status"], "USER_APPROVED")
+        await self._publish_status(updated, action["status"], updated["status"], "USER_APPROVED", event_context)
         return updated
 
     async def reject_action(self, identity: dict, input_data: dict) -> dict:
         input_data = require_object(input_data, "input")
+        event_context = request_event_context(input_data)
         action = self._get_owned_action(identity, input_data.get("actionId"))
         require_action_status(action)
         if is_terminal_action_status(action["status"]):
@@ -141,11 +143,12 @@ class ActionService:
         if result["kind"] == "STATUS_MISMATCH" and is_terminal_or_raise(result["action"]):
             return result["action"]
         updated = require_transition_updated(result, "ACTION_NOT_REJECTABLE", "Action cannot be rejected from its current status")
-        await self._publish_status(updated, action["status"], updated["status"], reason_code)
+        await self._publish_status(updated, action["status"], updated["status"], reason_code, event_context)
         return updated
 
     async def apply_action(self, identity: dict, input_data: dict) -> dict:
         input_data = require_object(input_data, "input")
+        event_context = request_event_context(input_data)
         idempotency_key = require_non_blank_string(input_data.get("idempotencyKey"), "idempotencyKey")
         action = self._get_owned_action(identity, input_data.get("actionId"))
         require_action_status(action)
@@ -166,7 +169,7 @@ class ActionService:
                 {"expiredAt": isoformat_z(self.clock()), "reasonCode": "ACTION_EXPIRED", "idempotencyKey": idempotency_key},
             )
             if expired["transitioned"]:
-                await self._publish_status(expired["action"], action["status"], expired["action"]["status"], "ACTION_EXPIRED")
+                await self._publish_status(expired["action"], action["status"], expired["action"]["status"], "ACTION_EXPIRED", event_context)
             return terminal_result(expired["action"])
 
         consent = await maybe_await(
@@ -200,7 +203,13 @@ class ActionService:
                 },
             )
             if conflicted["transitioned"]:
-                await self._publish_status(conflicted["action"], action["status"], conflicted["action"]["status"], conflicted["action"]["reasonCode"])
+                await self._publish_status(
+                    conflicted["action"],
+                    action["status"],
+                    conflicted["action"]["status"],
+                    conflicted["action"]["reasonCode"],
+                    event_context,
+                )
             return terminal_result(conflicted["action"])
 
         reservation = self.action_store.reserve_apply(action["actionId"], idempotency_key, isoformat_z(self.clock()))
@@ -244,7 +253,7 @@ class ActionService:
                     "updatedAt": isoformat_z(self.clock()),
                 },
             )
-            await self._publish_status(failed, action["status"], failed["status"], "PROVIDER_WRITE_FAILED")
+            await self._publish_status(failed, action["status"], failed["status"], "PROVIDER_WRITE_FAILED", event_context)
             raise dependency_error("PROVIDER_WRITE_FAILED", "Provider write failed", {"actionId": action["actionId"]}) from error
 
         applied = self.action_store.complete_apply(
@@ -264,7 +273,7 @@ class ActionService:
                 "updatedAt": isoformat_z(self.clock()),
             },
         )
-        await self._publish_status(applied, action["status"], applied["status"], "APPLY_SUCCEEDED")
+        await self._publish_status(applied, action["status"], applied["status"], "APPLY_SUCCEEDED", event_context)
         return applied["applyResult"]
 
     def _get_owned_action(self, identity: dict, action_id: Any) -> dict:
@@ -296,7 +305,14 @@ class ActionService:
             )
         raise validation_error("ACTION_NOT_FOUND", "Action was not found", {"actionId": action["actionId"]})
 
-    async def _publish_status(self, action: dict, previous_status: str | None, status: str, reason_code: str) -> None:
+    async def _publish_status(
+        self,
+        action: dict,
+        previous_status: str | None,
+        status: str,
+        reason_code: str,
+        event_context: dict | None = None,
+    ) -> None:
         await maybe_await(
             self.event_publisher.publish(
                 {
@@ -306,6 +322,7 @@ class ActionService:
                     "previousStatus": previous_status,
                     "status": status,
                     "reasonCode": reason_code,
+                    **(event_context or {}),
                 }
             )
         )
@@ -313,6 +330,15 @@ class ActionService:
 
 def create_action_service(**kwargs: Any) -> ActionService:
     return ActionService(**kwargs)
+
+
+def request_event_context(input_data: dict) -> dict:
+    event_context: dict[str, str] = {}
+    if isinstance(input_data.get("requestId"), str) and input_data["requestId"].strip():
+        event_context["requestId"] = input_data["requestId"]
+    if isinstance(input_data.get("correlationId"), str) and input_data["correlationId"].strip():
+        event_context["correlationId"] = input_data["correlationId"]
+    return event_context
 
 
 def terminal_result(action: dict) -> dict:

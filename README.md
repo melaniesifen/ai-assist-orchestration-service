@@ -30,6 +30,7 @@ Proposed action IDs and expirations are server-owned. Callers may request a shor
 ## Package Layout
 
 - `ai_assist_orchestration/`: orchestration domain package.
+- `ai_assist_orchestration/http_adapter.py`: framework-neutral HTTP command boundary for future route adapters.
 - `tests/`: stdlib `unittest` coverage for command coordination and proposed-action lifecycle behavior.
 - `pyproject.toml`: Python packaging metadata with no runtime dependencies.
 

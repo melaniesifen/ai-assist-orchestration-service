@@ -35,6 +35,10 @@ Relevant LLDs:
 - Migration gate: Do not continue broad new feature work until the Python migration is completed or explicitly deferred.
 - [ ] REPO-001: Decide final language, runtime, package manager, framework, package layout, migration cost, deployment target, and test strategy for this repo.
 - [ ] EVT-001: Add the HTTP command API adapter for command creation, action approval/rejection, and apply-action with server-derived identity, request IDs, correlation IDs, and idempotency keys.
+  - [x] Add repo-local, framework-neutral Python HTTP boundary DTOs/adapters for command creation, action approval, action rejection, and apply-action.
+  - [x] Propagate request IDs and correlation IDs from the HTTP boundary into action status events.
+  - [x] Require an idempotency key for command creation and apply-action at the HTTP boundary.
+  - [ ] Align route names, shared request/response schemas, and contract tests with `ai-assist-contracts` once the cross-service HTTP API contracts are available.
 - [ ] EVT-004: Wire the injected event publisher to the session events service `SessionEvent` contract and categorize publisher failures without corrupting durable action state.
 - [ ] ACTION-001: Replace in-memory action storage with durable encrypted `ProposedActions` persistence scoped by tenant/user/session/resource.
 - [ ] ACTION-003: Expose authenticated HTTP approve/reject endpoints and contract tests against shared action schemas.

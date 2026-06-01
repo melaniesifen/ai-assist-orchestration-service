@@ -10,6 +10,7 @@ from .errors import (
     policy_error,
     validation_error,
 )
+from .http_adapter import HttpCommandBoundary, create_http_command_boundary
 
 __all__ = [
     "ACTION_STATUS",
@@ -17,10 +18,12 @@ __all__ = [
     "TERMINAL_ACTION_STATUSES",
     "InMemoryActionStore",
     "OrchestrationError",
+    "HttpCommandBoundary",
     "authorization_error",
     "conflict_error",
     "create_action_service",
     "create_command_service",
+    "create_http_command_boundary",
     "dependency_error",
     "policy_error",
     "validation_error",
