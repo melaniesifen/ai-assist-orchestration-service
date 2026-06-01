@@ -10,5 +10,5 @@ requires-python = ">=3.11"
 dependencies = []
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["ai_assist_orchestration*"]

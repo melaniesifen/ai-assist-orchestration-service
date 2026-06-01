@@ -17,7 +17,8 @@
 
 ## Commands
 
-- Run tests with `python3 -m unittest discover -s tests`.
+- Run tests with `PYTHONPATH=src python3 -m unittest discover -s tests`.
+- Run Python compile checks with `PYTHONPATH=src python3 -m compileall src tests`.
 - Prefer stdlib `unittest` for domain tests unless a production dependency justifies additional tooling.
 
 ## Review Notes

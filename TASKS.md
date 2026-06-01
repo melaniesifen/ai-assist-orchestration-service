@@ -28,6 +28,7 @@ Relevant LLDs:
 - [x] Document test and coverage commands in `README.md`.
 - [x] Ignore local prompts, feedback, coverage output, dependencies, and build artifacts.
 - [x] REPO-002: Migrate orchestration service to a Python package layout with equivalent command coordination, proposed-action lifecycle, policy/provider/context/event boundaries, tests, coverage workflow, and repo docs.
+- [x] Repo layout: standardize the Python package under `src/ai_assist_orchestration/` and document `PYTHONPATH=src` unittest and compile checks.
 
 ## Architecture Tasks Pending
 

@@ -29,8 +29,8 @@ Proposed action IDs and expirations are server-owned. Callers may request a shor
 
 ## Package Layout
 
-- `ai_assist_orchestration/`: orchestration domain package.
-- `ai_assist_orchestration/http_adapter.py`: framework-neutral HTTP command boundary for future route adapters.
+- `src/ai_assist_orchestration/`: orchestration domain package.
+- `src/ai_assist_orchestration/http_adapter.py`: framework-neutral HTTP command boundary for future route adapters.
 - `tests/`: stdlib `unittest` coverage for command coordination and proposed-action lifecycle behavior.
 - `pyproject.toml`: Python packaging metadata with no runtime dependencies.
 
@@ -43,7 +43,8 @@ Implementation tasks are tracked in [TASKS.md](TASKS.md). Update the checkboxes 
 Run the unit tests:
 
 ```sh
-python3 -m unittest discover -s tests
+PYTHONPATH=src python3 -m unittest discover -s tests
+PYTHONPATH=src python3 -m compileall src tests
 ```
 
 This repo currently has no coverage dependency. If coverage tooling is added later, keep generated reports out of git; `.gitignore` already excludes common Python and JavaScript coverage/build outputs.
