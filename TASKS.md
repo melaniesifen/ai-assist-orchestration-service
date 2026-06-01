@@ -4,6 +4,8 @@ Update this file as implementation progresses. Check off completed tasks in the 
 
 Canonical source: `../ai-assist-architecture/implementation-task-breakdown.md`.
 
+Workspace-level tasks listed below are tracked here only as orchestration-service implementation or wiring slices. They do not mark the full cross-repo task complete unless the canonical workspace task list says so.
+
 Relevant LLDs:
 
 - `../ai-assist-architecture/lld-actions-writeback.md`
