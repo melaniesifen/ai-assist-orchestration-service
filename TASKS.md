@@ -41,6 +41,9 @@ Relevant LLDs:
   - [x] Require an idempotency key for command creation and apply-action at the HTTP boundary.
   - [ ] Align route names, shared request/response schemas, and contract tests with `ai-assist-contracts` once the cross-service HTTP API contracts are available.
 - [ ] EVT-004: Wire the injected event publisher to the session events service `SessionEvent` contract and categorize publisher failures without corrupting durable action state.
+  - [x] M5-T3: Convert generic provider stream chunks into progress, assistant delta, assistant final, and safe error publish calls.
+  - [x] M5-T3: Categorize command event publisher failures as dependency errors with metadata-only details.
+  - [ ] Wire published events to the full session-events `SessionEvent` envelope once the cross-repo event bridge is available.
 - [ ] ACTION-001: Replace in-memory action storage with durable encrypted `ProposedActions` persistence scoped by tenant/user/session/resource.
 - [ ] ACTION-003: Expose authenticated HTTP approve/reject endpoints and contract tests against shared action schemas.
 - [ ] ACTION-004: Expose authenticated HTTP apply-action endpoint and wire real context consent, connector target verification, connector write-back, and idempotency persistence.

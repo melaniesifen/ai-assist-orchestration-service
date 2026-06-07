@@ -179,6 +179,133 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"messageId": "msg_001", "finishReason": "stop", "provider": "openai"})
         self.assertEqual([event["type"] for event in events], ["progress", "progress", "assistant.delta", "assistant.delta", "assistant.final"])
 
+    async def test_converts_provider_stream_chunks_to_assistant_events(self) -> None:
+        events = []
+        observed_provider_request = {}
+
+        class StreamProvider:
+            async def stream(self, request):
+                observed_provider_request.update(request)
+                yield {"type": "assistant.delta", "provider": "openai", "model": "test-model", "delta": "first "}
+                yield {"type": "assistant.delta", "provider": "openai", "model": "test-model", "delta": "second"}
+                yield {
+                    "type": "assistant.final",
+                    "provider": "openai",
+                    "model": "test-model",
+                    "finishReason": "stop",
+                    "usage": {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5},
+                }
+
+        service = create_command_service(
+            clock=lambda: NOW,
+            policy_service=SimplePolicy({"decision": "ALLOW", "decisionId": "pol_stream"}),
+            context_service=SimpleContext(
+                {
+                    "authorized": True,
+                    "contextMode": "SELECTION",
+                    "resourceRef": {"provider": "google_docs", "resourceId": "doc_001"},
+                    "provenance": {"connectorVerified": True, "resourceVersion": "rev_001"},
+                }
+            ),
+            provider_registry={"openai": StreamProvider()},
+            prompt_builder=SimplePromptBuilder(),
+            event_publisher=Publisher(events),
+        )
+
+        result = await service.run_assistant_command(IDENTITY, base_command_input())
+
+        self.assertEqual(result, {"messageId": "msg_req_001", "finishReason": "stop", "provider": "openai"})
+        self.assertEqual([event["type"] for event in events], ["progress", "progress", "assistant.delta", "assistant.delta", "assistant.final"])
+        self.assertEqual(events[2]["messageId"], "msg_req_001")
+        self.assertEqual(events[2]["index"], 0)
+        self.assertEqual(events[3]["index"], 1)
+        self.assertEqual(events[4]["usage"], {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5})
+        self.assertEqual(observed_provider_request["context"]["contextMode"], "SELECTION")
+        self.assertTrue(observed_provider_request["context"]["provenance"]["connectorVerified"])
+
+    async def test_context_failures_publish_safe_error_event(self) -> None:
+        events = []
+        service = create_command_service(
+            policy_service=SimplePolicy({"decision": "ALLOW"}),
+            context_service=SimpleContext(
+                {
+                    "authorized": False,
+                    "reasonCode": "CONSENT_REQUIRED",
+                    "content": "raw document text must not be published",
+                }
+            ),
+            provider_registry={"openai": object()},
+            prompt_builder=SimplePromptBuilder(),
+            event_publisher=Publisher(events),
+        )
+
+        with self.assertRaises(OrchestrationError) as caught:
+            await service.run_assistant_command(IDENTITY, base_command_input())
+
+        self.assertEqual(caught.exception.code, "CONTEXT_UNAVAILABLE")
+        self.assertEqual([event["type"] for event in events], ["progress", "error"])
+        self.assertEqual(events[-1]["errorCode"], "CONTEXT_UNAVAILABLE")
+        self.assertEqual(events[-1]["metadata"], {"sessionId": "session_001", "reasonCode": "CONSENT_REQUIRED"})
+        self.assertNotIn("raw document text", str(events[-1]))
+
+    async def test_provider_stream_error_publishes_safe_error_event(self) -> None:
+        events = []
+
+        class ErrorProvider:
+            async def stream(self, _request):
+                yield {
+                    "type": "error",
+                    "provider": "openai",
+                    "model": "test-model",
+                    "error": {
+                        "code": "PROVIDER_RATE_LIMITED",
+                        "category": "rate_limited",
+                        "message": "Provider asked the service to retry later.",
+                        "dependencyStatus": "rate_limited",
+                        "retryAfterSeconds": 30,
+                        "rawResponse": "raw provider body must not be published",
+                    },
+                }
+
+        service = create_command_service(
+            policy_service=SimplePolicy({"decision": "ALLOW"}),
+            context_service=SimpleContext({"authorized": True}),
+            provider_registry={"openai": ErrorProvider()},
+            prompt_builder=SimplePromptBuilder(),
+            event_publisher=Publisher(events),
+        )
+
+        with self.assertRaises(OrchestrationError) as caught:
+            await service.run_assistant_command(IDENTITY, base_command_input())
+
+        self.assertEqual(caught.exception.code, "PROVIDER_RATE_LIMITED")
+        self.assertEqual(caught.exception.category, "RATE_LIMITED")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual([event["type"] for event in events], ["progress", "progress", "error"])
+        self.assertEqual(events[-1]["category"], "RATE_LIMITED")
+        self.assertEqual(events[-1]["retryable"], True)
+        self.assertEqual(events[-1]["metadata"]["dependencyStatus"], "rate_limited")
+        self.assertEqual(events[-1]["metadata"]["retryAfterSeconds"], 30)
+        self.assertNotIn("raw provider body", str(events[-1]))
+
+    async def test_publisher_failures_are_categorized_as_dependency_errors(self) -> None:
+        service = create_command_service(
+            policy_service=SimplePolicy({"decision": "ALLOW"}),
+            context_service=SimpleContext({"authorized": True}),
+            provider_registry={"openai": LegacyProvider()},
+            prompt_builder=SimplePromptBuilder(),
+            event_publisher=FailingPublisher(fail_on_type="assistant.final"),
+        )
+
+        with self.assertRaises(OrchestrationError) as caught:
+            await service.run_assistant_command(IDENTITY, base_command_input())
+
+        self.assertEqual(caught.exception.code, "EVENT_PUBLISH_FAILED")
+        self.assertEqual(caught.exception.category, "DEPENDENCY")
+        self.assertEqual(caught.exception.metadata["eventType"], "assistant.final")
+        self.assertEqual(caught.exception.metadata["sessionId"], "session_001")
+
     async def test_blocks_commands_when_policy_dependency_denies_them(self) -> None:
         service = create_command_service(
             policy_service=SimplePolicy({"decision": "BLOCK", "decisionId": "pol_002", "reasonCode": "PUBLIC_POLICY_NOT_CONFIGURED"}),
@@ -450,12 +577,39 @@ def base_action_input():
     }
 
 
+def base_command_input():
+    return {
+        "commandId": "cmd_001",
+        "requestId": "req_001",
+        "correlationId": "corr_001",
+        "sessionId": "session_001",
+        "provider": "openai",
+        "resourceId": "doc_001",
+        "contextMode": "SELECTION",
+        "secretRef": "secret_ref_001",
+    }
+
+
 class Publisher:
     def __init__(self, events):
         self.events = events
 
     async def publish(self, event):
         self.events.append(event)
+
+
+class FailingPublisher:
+    def __init__(self, *, fail_on_type):
+        self.fail_on_type = fail_on_type
+
+    async def publish(self, event):
+        if event.get("type") == self.fail_on_type:
+            raise RuntimeError("publisher unavailable")
+
+
+class LegacyProvider:
+    async def generate(self, _request):
+        return {"messageId": "msg_001", "deltas": ["ok"], "finishReason": "stop", "usage": {}}
 
 
 class SimplePolicy:
