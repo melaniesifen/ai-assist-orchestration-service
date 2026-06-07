@@ -178,6 +178,13 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"messageId": "msg_001", "finishReason": "stop", "provider": "openai"})
         self.assertEqual([event["type"] for event in events], ["progress", "progress", "assistant.delta", "assistant.delta", "assistant.final"])
+        self.assertEqual(
+            [(event["stage"], event["status"], event["messageCode"]) for event in events[:2]],
+            [
+                ("context.loading", "started", "CONTEXT.LOADING.STARTED"),
+                ("provider.generating", "in_progress", "PROVIDER.GENERATING.IN_PROGRESS"),
+            ],
+        )
 
     async def test_converts_provider_stream_chunks_to_assistant_events(self) -> None:
         events = []

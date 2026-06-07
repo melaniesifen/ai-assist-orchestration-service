@@ -95,7 +95,7 @@ class CommandService:
         if provider is None:
             raise validation_error("PROVIDER_UNSUPPORTED", "Provider is not configured", {"provider": provider_name})
 
-        await self._publish_progress(session_id, request_id, correlation_id, "context.loading", "STARTED")
+        await self._publish_progress(session_id, request_id, correlation_id, "context.loading", "started")
         try:
             context = await maybe_await(
                 self.context_service.resolve_context(
@@ -126,7 +126,7 @@ class CommandService:
             await self._publish_error(session_id, request_id, correlation_id, safe_error)
             raise safe_error from error
 
-        await self._publish_progress(session_id, request_id, correlation_id, "provider.generating", "STARTED")
+        await self._publish_progress(session_id, request_id, correlation_id, "provider.generating", "in_progress")
         prompt = await maybe_await(self.prompt_builder.build_prompt({"command": command, "context": context}))
         provider_request = {
             "prompt": prompt,
