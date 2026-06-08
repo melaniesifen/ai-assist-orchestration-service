@@ -39,6 +39,7 @@ class ActionService:
         event_publisher: Any,
         consent_service: Any,
         payload_vault: Any,
+        token_service: Any | None = None,
         clock: Callable[[], Any] = utc_now,
         id_generator: Callable[[str], str] | None = None,
     ) -> None:
@@ -49,6 +50,7 @@ class ActionService:
         self.event_publisher = event_publisher
         self.consent_service = consent_service
         self.payload_vault = payload_vault
+        self.token_service = token_service
         self.clock = clock
         self.id_generator = id_generator or (lambda prefix: f"{prefix}_{uuid4().hex}")
 
@@ -187,46 +189,6 @@ class ActionService:
             return terminal_result(expired["action"])
         action = expired["action"]
 
-        consent = await maybe_await(
-            self.consent_service.validate_apply_consent(
-                {
-                    "tenantId": action["tenantId"],
-                    "userId": action["userId"],
-                    "sessionId": action["sessionId"],
-                    "resourceId": action["resourceId"],
-                    "actionType": action["actionType"],
-                }
-            )
-        )
-        if not consent or not consent.get("allowed"):
-            raise conflict_error(
-                "CONSENT_REQUIRED",
-                "Consent is required before applying this action",
-                {"actionId": action["actionId"], "reasonCode": (consent or {}).get("reasonCode", "CONSENT_REQUIRED")},
-            )
-
-        validation = await maybe_await(self.connector.validate_target(action))
-        if not validation or not validation.get("valid"):
-            conflicted = self._transition(
-                action,
-                ACTION_STATUS.CONFLICTED.value,
-                {
-                    "conflictedAt": isoformat_z(self.clock()),
-                    "conflictDetails": to_safe_conflict_details((validation or {}).get("conflictDetails", {})),
-                    "reasonCode": (validation or {}).get("reasonCode", "TARGET_CONFLICT"),
-                    "idempotencyKey": idempotency_key,
-                },
-            )
-            if conflicted["transitioned"]:
-                await self._publish_status(
-                    conflicted["action"],
-                    action["status"],
-                    conflicted["action"]["status"],
-                    conflicted["action"]["reasonCode"],
-                    event_context,
-                )
-            return terminal_result(conflicted["action"])
-
         reservation = self.action_store.reserve_apply(action["actionId"], idempotency_key, isoformat_z(self.clock()))
         if reservation["kind"] == "REPLAY":
             return reservation["applyResult"]
@@ -242,9 +204,93 @@ class ActionService:
                 "Action could not be reserved for apply",
                 {"actionId": action["actionId"], "status": action["status"]},
             )
-
         reserved_action = reservation["action"]
-        payload = await maybe_await(self.payload_vault.decrypt(reserved_action["encryptedPayload"]))
+
+        try:
+            consent = await maybe_await(
+                self.consent_service.validate_apply_consent(
+                    {
+                        "tenantId": reserved_action["tenantId"],
+                        "userId": reserved_action["userId"],
+                        "sessionId": reserved_action["sessionId"],
+                        "resourceId": reserved_action["resourceId"],
+                        "actionType": reserved_action["actionType"],
+                    }
+                )
+            )
+        except Exception as error:
+            failed = self._complete_reserved_apply_failure(reserved_action, idempotency_key, "CONSENT_CHECK_FAILED")
+            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            raise dependency_error("CONSENT_CHECK_FAILED", "Consent status could not be validated", {"actionId": action["actionId"]}) from error
+        if not consent or not consent.get("allowed"):
+            conflicted = self._complete_reserved_apply(
+                reserved_action,
+                idempotency_key,
+                ACTION_STATUS.CONFLICTED.value,
+                {
+                    "conflictedAt": isoformat_z(self.clock()),
+                    "conflictDetails": to_safe_conflict_details((consent or {}).get("conflictDetails", {})),
+                    "reasonCode": (consent or {}).get("reasonCode", "CONSENT_REQUIRED"),
+                },
+            )
+            await self._publish_status(conflicted, action["status"], conflicted["status"], conflicted["reasonCode"], event_context)
+            return terminal_result(conflicted)
+
+        try:
+            token_status = await self._validate_token_status(reserved_action)
+        except Exception as error:
+            failed = self._complete_reserved_apply_failure(reserved_action, idempotency_key, "TOKEN_STATUS_CHECK_FAILED")
+            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            raise dependency_error("TOKEN_STATUS_CHECK_FAILED", "Token status could not be validated", {"actionId": action["actionId"]}) from error
+        if not token_status.get("valid"):
+            failed = self._complete_reserved_apply(
+                reserved_action,
+                idempotency_key,
+                ACTION_STATUS.FAILED.value,
+                {
+                    "failedAt": isoformat_z(self.clock()),
+                    "reasonCode": token_status.get("reasonCode", "RECONNECT_REQUIRED"),
+                    "failureCode": token_status.get("reasonCode", "RECONNECT_REQUIRED"),
+                },
+            )
+            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            return terminal_result(failed)
+
+        try:
+            validation = await maybe_await(self.connector.validate_target(reserved_action))
+        except Exception as error:
+            failed = self._complete_reserved_apply_failure(reserved_action, idempotency_key, "TARGET_VALIDATION_FAILED")
+            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            raise dependency_error("TARGET_VALIDATION_FAILED", "Mutation target could not be validated", {"actionId": action["actionId"]}) from error
+        if not validation or not validation.get("valid"):
+            conflicted = self._complete_reserved_apply(
+                reserved_action,
+                idempotency_key,
+                ACTION_STATUS.CONFLICTED.value,
+                {
+                    "conflictedAt": isoformat_z(self.clock()),
+                    "conflictDetails": to_safe_conflict_details((validation or {}).get("conflictDetails", {})),
+                    "reasonCode": (validation or {}).get("reasonCode", "TARGET_CONFLICT"),
+                },
+            )
+            await self._publish_status(conflicted, action["status"], conflicted["status"], conflicted["reasonCode"], event_context)
+            return terminal_result(conflicted)
+
+        try:
+            payload = await maybe_await(self.payload_vault.decrypt(reserved_action["encryptedPayload"]))
+        except Exception as error:
+            failed = self._complete_reserved_apply(
+                reserved_action,
+                idempotency_key,
+                ACTION_STATUS.FAILED.value,
+                {
+                    "failedAt": isoformat_z(self.clock()),
+                    "reasonCode": "ACTION_PAYLOAD_DECRYPT_FAILED",
+                    "failureCode": "ACTION_PAYLOAD_DECRYPT_FAILED",
+                },
+            )
+            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            raise dependency_error("ACTION_PAYLOAD_DECRYPT_FAILED", "Action payload could not be decrypted", {"actionId": action["actionId"]}) from error
         try:
             apply_result = await maybe_await(
                 self.connector.apply_action(
@@ -290,6 +336,64 @@ class ActionService:
         )
         await self._publish_status(applied, action["status"], applied["status"], "APPLY_SUCCEEDED", event_context)
         return applied["applyResult"]
+
+    def _complete_reserved_apply_failure(self, action: dict, idempotency_key: str, reason_code: str) -> dict:
+        return self._complete_reserved_apply(
+            action,
+            idempotency_key,
+            ACTION_STATUS.FAILED.value,
+            {
+                "failedAt": isoformat_z(self.clock()),
+                "reasonCode": reason_code,
+                "failureCode": reason_code,
+            },
+        )
+
+    async def _validate_token_status(self, action: dict) -> dict:
+        if not self.token_service:
+            return {"valid": True}
+        result = await maybe_await(
+            self.token_service.validate_apply_token(
+                {
+                    "tenantId": action["tenantId"],
+                    "userId": action["userId"],
+                    "provider": action["provider"],
+                    "resourceId": action["resourceId"],
+                    "sessionId": action["sessionId"],
+                }
+            )
+        )
+        return result if isinstance(result, dict) else {"valid": False, "reasonCode": "RECONNECT_REQUIRED"}
+
+    def _complete_reserved_apply(self, action: dict, idempotency_key: str, status: str, patch: dict) -> dict:
+        apply_result = {
+            "status": status,
+            "actionId": action["actionId"],
+            "reasonCode": patch.get("reasonCode"),
+            "conflictDetails": patch.get("conflictDetails"),
+            "providerOperationId": patch.get("providerOperationId"),
+        }
+        completed = self.action_store.complete_apply(
+            action["actionId"],
+            idempotency_key,
+            {
+                **patch,
+                "status": status,
+                "idempotencyKey": idempotency_key,
+                "applyResult": apply_result,
+                "updatedAt": isoformat_z(self.clock()),
+            },
+        )
+        if completed and completed.get("status") == status:
+            return completed
+        current = self.action_store.get(action["actionId"])
+        if current and is_terminal_action_status(current["status"]):
+            return current
+        raise conflict_error(
+            "ACTION_NOT_APPLIABLE",
+            "Action could not be completed for apply",
+            {"actionId": action["actionId"], "status": (current or action).get("status")},
+        )
 
     def _get_authorized_action(self, identity: dict, input_data: dict) -> dict:
         assert_identity(identity)

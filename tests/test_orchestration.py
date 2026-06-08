@@ -770,6 +770,113 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         await first
         self.assertEqual(connector.write_count, 1)
 
+    async def test_reserves_apply_before_target_validation_so_duplicate_requests_wait(self) -> None:
+        validation_gate = asyncio.Event()
+        connector = BlockingValidationConnector(validation_gate)
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(action_store=action_store, connector=connector)
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+
+        first = asyncio.create_task(service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_validation_race")))
+        await asyncio.sleep(0)
+        with self.assertRaises(OrchestrationError) as caught:
+            await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_validation_race"))
+        self.assertEqual(caught.exception.code, "ACTION_APPLY_IN_PROGRESS")
+        validation_gate.set()
+        await first
+        self.assertEqual(connector.validation_count, 1)
+        self.assertEqual(connector.write_count, 1)
+
+    async def test_revoked_consent_conflicts_and_skips_connector_mutation(self) -> None:
+        events = []
+        connector = RecordingConnector({"valid": True, "verifiedTarget": {"revision": "rev_001"}}, {"providerOperationId": "should_not_happen"})
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            events=events,
+            connector=connector,
+            consent_service=ConsentService({"allowed": False, "reasonCode": "CONSENT_REVOKED"}),
+        )
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+
+        result = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_consent_revoked"))
+
+        self.assertEqual(result["status"], ACTION_STATUS.CONFLICTED.value)
+        self.assertEqual(result["reasonCode"], "CONSENT_REVOKED")
+        self.assertEqual(connector.validation_count, 0)
+        self.assertEqual(connector.write_count, 0)
+        self.assertEqual(action_store.get(proposed["actionId"])["status"], ACTION_STATUS.CONFLICTED.value)
+        self.assertTrue(any(event.get("status") == ACTION_STATUS.CONFLICTED.value and event.get("reasonCode") == "CONSENT_REVOKED" for event in events))
+
+    async def test_reconnect_required_token_status_fails_safely_before_target_validation(self) -> None:
+        events = []
+        connector = RecordingConnector({"valid": True, "verifiedTarget": {"revision": "rev_001"}}, {"providerOperationId": "should_not_happen"})
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            events=events,
+            connector=connector,
+            token_service=TokenService({"valid": False, "reasonCode": "RECONNECT_REQUIRED"}),
+        )
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+
+        result = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_reconnect"))
+
+        self.assertEqual(result["status"], ACTION_STATUS.FAILED.value)
+        self.assertEqual(result["reasonCode"], "RECONNECT_REQUIRED")
+        self.assertEqual(connector.validation_count, 0)
+        self.assertEqual(connector.write_count, 0)
+        self.assertEqual(action_store.get(proposed["actionId"])["failureCode"], "RECONNECT_REQUIRED")
+        self.assertTrue(any(event.get("status") == ACTION_STATUS.FAILED.value and event.get("reasonCode") == "RECONNECT_REQUIRED" for event in events))
+
+    async def test_payload_decrypt_failure_fails_safely_before_connector_mutation(self) -> None:
+        events = []
+        connector = RecordingConnector({"valid": True, "verifiedTarget": {"revision": "rev_001"}}, {"providerOperationId": "should_not_happen"})
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            events=events,
+            connector=connector,
+            payload_vault=FailingPayloadVault(),
+        )
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+
+        with self.assertRaises(OrchestrationError) as caught:
+            await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_decrypt"))
+
+        self.assertEqual(caught.exception.code, "ACTION_PAYLOAD_DECRYPT_FAILED")
+        self.assertEqual(connector.validation_count, 1)
+        self.assertEqual(connector.write_count, 0)
+        persisted = action_store.get(proposed["actionId"])
+        self.assertEqual(persisted["status"], ACTION_STATUS.FAILED.value)
+        self.assertEqual(persisted["failureCode"], "ACTION_PAYLOAD_DECRYPT_FAILED")
+        self.assertTrue(any(event.get("status") == ACTION_STATUS.FAILED.value and event.get("reasonCode") == "ACTION_PAYLOAD_DECRYPT_FAILED" for event in events))
+
+    async def test_target_validation_dependency_failure_clears_apply_lock_and_publishes_failure(self) -> None:
+        events = []
+        connector = FailingValidationConnector()
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(action_store=action_store, events=events, connector=connector)
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+
+        with self.assertRaises(OrchestrationError) as caught:
+            await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_target_dependency"))
+        replay = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_target_dependency"))
+
+        self.assertEqual(caught.exception.code, "TARGET_VALIDATION_FAILED")
+        self.assertEqual(replay["status"], ACTION_STATUS.FAILED.value)
+        self.assertEqual(replay["reasonCode"], "TARGET_VALIDATION_FAILED")
+        self.assertEqual(connector.write_count, 0)
+        persisted = action_store.get(proposed["actionId"])
+        self.assertNotIn("applyLock", persisted)
+        self.assertEqual(persisted["failureCode"], "TARGET_VALIDATION_FAILED")
+        self.assertTrue(any(event.get("status") == ACTION_STATUS.FAILED.value and event.get("reasonCode") == "TARGET_VALIDATION_FAILED" for event in events))
+
     async def test_action_methods_return_typed_validation_errors_for_malformed_inputs(self) -> None:
         service = create_test_action_service(
             action_store=InMemoryActionStore(),
@@ -860,15 +967,16 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(conflict_events), 1)
 
 
-def create_test_action_service(*, action_store, connector, events=None, id_generator=None):
+def create_test_action_service(*, action_store, connector, events=None, id_generator=None, consent_service=None, payload_vault=None, token_service=None):
     return create_action_service(
         action_store=action_store,
         connector=connector,
         clock=lambda: NOW,
         id_generator=id_generator or (lambda _prefix: "action_001"),
         event_publisher=Publisher(events if events is not None else []),
-        consent_service=ConsentService(),
-        payload_vault=PayloadVault(),
+        consent_service=consent_service or ConsentService(),
+        payload_vault=payload_vault or PayloadVault(),
+        token_service=token_service,
     )
 
 
@@ -1010,8 +1118,19 @@ class SimplePromptBuilder:
 
 
 class ConsentService:
+    def __init__(self, response=None):
+        self.response = response or {"allowed": True}
+
     async def validate_apply_consent(self, _request):
-        return {"allowed": True}
+        return self.response
+
+
+class TokenService:
+    def __init__(self, response):
+        self.response = response
+
+    async def validate_apply_token(self, _request):
+        return self.response
 
 
 class PayloadVault:
@@ -1029,13 +1148,20 @@ class PayloadVault:
         return self.payloads[encrypted_payload["ciphertextRef"]]
 
 
+class FailingPayloadVault(PayloadVault):
+    async def decrypt(self, _encrypted_payload):
+        raise RuntimeError("kms decrypt unavailable")
+
+
 class RecordingConnector:
     def __init__(self, validation, apply_result):
         self.validation = validation
         self.apply_result = apply_result
+        self.validation_count = 0
         self.write_count = 0
 
     async def validate_target(self, _action):
+        self.validation_count += 1
         return self.validation
 
     async def apply_action(self, _request):
@@ -1052,6 +1178,26 @@ class BlockingConnector(RecordingConnector):
         self.write_count += 1
         await self.gate.wait()
         return self.apply_result
+
+
+class BlockingValidationConnector(RecordingConnector):
+    def __init__(self, validation_gate):
+        super().__init__({"valid": True, "verifiedTarget": {"revision": "rev_001"}}, {"providerOperationId": "google_op_001"})
+        self.validation_gate = validation_gate
+
+    async def validate_target(self, action):
+        self.validation_count += 1
+        await self.validation_gate.wait()
+        return self.validation
+
+
+class FailingValidationConnector(RecordingConnector):
+    def __init__(self):
+        super().__init__({"valid": True}, {"providerOperationId": "should_not_happen"})
+
+    async def validate_target(self, _action):
+        self.validation_count += 1
+        raise RuntimeError("target validation unavailable")
 
 
 class StaleApproveRaceStore(InMemoryActionStore):

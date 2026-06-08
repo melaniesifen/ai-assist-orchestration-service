@@ -38,6 +38,13 @@ Relevant LLDs:
 - [x] M6-T2: Verify the fake encryption boundary and metadata-only action event payloads.
 - [x] M6-T2: Publish `action.proposed` and `action.status_changed` calls from orchestration action lifecycle paths.
 
+## Completed M7 Local Tasks
+
+- [x] M7-T3: Verify apply-action requires server-derived identity, scoped session/resource/action references, request metadata, and an idempotency key.
+- [x] M7-T3: Reserve apply idempotency before consent, token, target verification, decrypt, or connector mutation dependency calls.
+- [x] M7-T3: Verify revoked consent, reconnect-required token status, stale target, payload decrypt failure, and provider write failure paths skip connector mutation where safe.
+- [x] M7-T3: Verify successful apply, conflicted apply, failed apply, expired apply, same-key replay, different-key terminal replay, and `action.status_changed` publishing.
+
 ## Architecture Tasks Pending
 
 - Approved direction: migrate from the temporary Node.js ESM bootstrap to Python initially. Revisit Java only if long-running workflow throughput or typed domain needs justify it.
