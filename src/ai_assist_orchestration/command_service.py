@@ -12,6 +12,12 @@ EVENT_TYPE_ASSISTANT_DELTA = "assistant.delta"
 EVENT_TYPE_ASSISTANT_FINAL = "assistant.final"
 EVENT_TYPE_ERROR = "error"
 EVENT_TYPE_PROGRESS = "progress"
+EVENT_TYPE_ACTION_CREATING_STAGE = "action.creating"
+PROPOSAL_BATCH_KEY = "proposalBatch"
+PROPOSALS_KEY = "proposals"
+ACTION_TYPE_INSERT_TEXT = "insert_text"
+ACTION_TYPE_REPLACE_TEXT = "replace_text"
+SUPPORTED_PROPOSAL_ACTION_TYPES = frozenset({ACTION_TYPE_INSERT_TEXT, ACTION_TYPE_REPLACE_TEXT})
 
 ERROR_CODE_CONTEXT_UNAVAILABLE = "CONTEXT_UNAVAILABLE"
 ERROR_CODE_EVENT_PUBLISH_FAILED = "EVENT_PUBLISH_FAILED"
@@ -49,6 +55,7 @@ class CommandService:
         event_publisher: Any,
         policy_service: Any,
         prompt_builder: Any,
+        action_service: Any | None = None,
         clock: Callable[[], Any] = utc_now,
     ) -> None:
         if not context_service or provider_registry is None or not event_publisher or not policy_service or not prompt_builder:
@@ -58,6 +65,7 @@ class CommandService:
         self.event_publisher = event_publisher
         self.policy_service = policy_service
         self.prompt_builder = prompt_builder
+        self.action_service = action_service
         self.clock = clock
 
     async def run_assistant_command(self, identity: dict, command: dict) -> dict:
@@ -161,6 +169,12 @@ class CommandService:
                     "Provider stream did not produce a final response",
                     {"sessionId": session_id, "provider": provider_name, "dependencyStatus": "malformed"},
                 )
+            created_actions = await self._create_proposed_actions_from_provider_output(
+                identity,
+                command,
+                context,
+                final_event,
+            )
         except OrchestrationError as error:
             if error.code != ERROR_CODE_EVENT_PUBLISH_FAILED:
                 await self._publish_error(session_id, request_id, correlation_id, error)
@@ -178,7 +192,47 @@ class CommandService:
             "messageId": final_event.get("messageId"),
             "finishReason": final_event.get("finishReason"),
             "provider": provider_name,
+            **({"proposedActionIds": [action["actionId"] for action in created_actions]} if created_actions else {}),
         }
+
+    async def _create_proposed_actions_from_provider_output(
+        self,
+        identity: dict,
+        command: dict,
+        context: dict,
+        final_event: dict,
+    ) -> list[dict]:
+        if self.action_service is None:
+            return []
+        proposals = provider_proposals(final_event)
+        if not proposals:
+            return []
+
+        session_id = require_non_blank_string(command.get("sessionId"), "command.sessionId")
+        request_id = require_non_blank_string(command.get("requestId"), "command.requestId")
+        correlation_id = require_non_blank_string(command.get("correlationId"), "command.correlationId")
+        resource_ref = resolve_resource_ref(command, context)
+        resource_revision = resolve_resource_revision(context)
+        action_inputs = normalize_provider_proposal_batch(
+            proposals,
+            session_id=session_id,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            resource_ref=resource_ref,
+            resource_revision=resource_revision,
+        )
+
+        await self._publish_progress(session_id, request_id, correlation_id, EVENT_TYPE_ACTION_CREATING_STAGE, "in_progress")
+        created_actions = []
+        for action_input in action_inputs:
+            action = await maybe_await(
+                self.action_service.create_proposed_action(
+                    identity,
+                    action_input,
+                )
+            )
+            created_actions.append(action)
+        return created_actions
 
     async def _provider_stream_events(self, provider: Any, request: dict) -> Any:
         if hasattr(provider, "stream") and callable(provider.stream):
@@ -305,6 +359,150 @@ class CommandService:
 
 def create_command_service(**kwargs: Any) -> CommandService:
     return CommandService(**kwargs)
+
+
+def provider_proposals(final_event: dict) -> list:
+    batch = final_event.get(PROPOSAL_BATCH_KEY)
+    if isinstance(batch, Mapping) and isinstance(batch.get(PROPOSALS_KEY), list):
+        return batch[PROPOSALS_KEY]
+    proposals = final_event.get(PROPOSALS_KEY)
+    return proposals if isinstance(proposals, list) else []
+
+
+def normalize_provider_proposal_batch(
+    proposals: list,
+    *,
+    session_id: str,
+    request_id: str,
+    correlation_id: str,
+    resource_ref: dict,
+    resource_revision: str,
+) -> list[dict]:
+    normalized = [
+        normalize_provider_proposal(
+            proposal,
+            index=index,
+            session_id=session_id,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            resource_ref=resource_ref,
+            resource_revision=resource_revision,
+        )
+        for index, proposal in enumerate(proposals)
+    ]
+    reject_overlapping_replace_ranges(normalized)
+    return normalized
+
+
+def normalize_provider_proposal(
+    proposal: Any,
+    *,
+    index: int,
+    session_id: str,
+    request_id: str,
+    correlation_id: str,
+    resource_ref: dict,
+    resource_revision: str,
+) -> dict:
+    proposal = require_object(proposal, f"providerProposal[{index}]")
+    target_hint = proposal.get("targetHint") if isinstance(proposal.get("targetHint"), Mapping) else {}
+    action_type = proposal.get("actionType", ACTION_TYPE_REPLACE_TEXT)
+    if action_type not in SUPPORTED_PROPOSAL_ACTION_TYPES:
+        raise validation_error(
+            "UNSUPPORTED_ACTION_TYPE",
+            "Provider proposal action type is not supported",
+            {"actionType": action_type, "proposalIndex": index},
+        )
+
+    target_range = target_hint.get("targetRange") or proposal.get("targetRange")
+    target_anchor = target_hint.get("targetAnchor") or proposal.get("targetAnchor")
+    if target_range is not None and not is_valid_target_range(target_range):
+        raise validation_error("INVALID_ACTION_TARGET", "Provider proposal targetRange is malformed", {"proposalIndex": index})
+    if target_anchor is not None and not is_valid_target_anchor(target_anchor):
+        raise validation_error("INVALID_ACTION_TARGET", "Provider proposal targetAnchor is malformed", {"proposalIndex": index})
+    if target_range is None and target_anchor is None:
+        raise validation_error("INVALID_ACTION_TARGET", "Provider proposal target is required", {"proposalIndex": index})
+
+    original_text_hash = target_hint.get("originalTextHash") or proposal.get("originalTextHash")
+    if action_type == ACTION_TYPE_REPLACE_TEXT:
+        original_text_hash = require_non_blank_string(original_text_hash, "providerProposal.originalTextHash")
+
+    return {
+        "requestId": request_id,
+        "correlationId": correlation_id,
+        "sessionId": session_id,
+        "provider": resource_ref["provider"],
+        "resourceId": resource_ref["resourceId"],
+        "resourceRevision": proposal.get("resourceRevision") or resource_revision,
+        "targetAnchor": target_anchor,
+        "targetRange": target_range,
+        "originalTextHash": original_text_hash or "sha256:not-required-for-insert",
+        "actionType": action_type,
+        "summary": proposal_safe_summary(proposal),
+        "payload": {
+            "proposalId": proposal.get("proposalId"),
+            "currentText": proposal.get("currentText"),
+            "proposedText": proposal.get("proposedText"),
+            "surroundingText": proposal.get("surroundingText"),
+            "rationale": proposal.get("rationale"),
+        },
+    }
+
+
+def reject_overlapping_replace_ranges(action_inputs: list[dict]) -> None:
+    ranges = []
+    for index, action_input in enumerate(action_inputs):
+        if action_input["actionType"] != ACTION_TYPE_REPLACE_TEXT:
+            continue
+        target_range = action_input.get("targetRange")
+        if target_range is None:
+            continue
+        ranges.append((target_range["start"], target_range["end"], index))
+    sorted_ranges = sorted(ranges)
+    for previous, current in zip(sorted_ranges, sorted_ranges[1:]):
+        if current[0] < previous[1]:
+            raise validation_error(
+                "OVERLAPPING_ACTION_TARGETS",
+                "Provider proposal target ranges overlap",
+                {"proposalIndex": current[2], "overlapsProposalIndex": previous[2]},
+            )
+
+
+def is_valid_target_anchor(value: Any) -> bool:
+    return isinstance(value, Mapping) and any(isinstance(item, str) and item.strip() for item in value.values())
+
+
+def is_valid_target_range(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    start = value.get("start")
+    end = value.get("end")
+    return isinstance(start, int) and isinstance(end, int) and start >= 0 and end > start
+
+
+def resolve_resource_ref(command: dict, context: dict) -> dict:
+    resource_ref = context.get("resourceRef") if isinstance(context.get("resourceRef"), Mapping) else {}
+    provider = resource_ref.get("provider") or command.get("resourceProvider")
+    resource_id = resource_ref.get("resourceId") or command.get("resourceId")
+    return {
+        "provider": require_non_blank_string(provider, "context.resourceRef.provider"),
+        "resourceId": require_non_blank_string(resource_id, "context.resourceRef.resourceId"),
+    }
+
+
+def resolve_resource_revision(context: dict) -> str:
+    provenance = context.get("provenance") if isinstance(context.get("provenance"), Mapping) else {}
+    return require_non_blank_string(
+        context.get("resourceRevision") or provenance.get("resourceRevision") or provenance.get("resourceVersion"),
+        "context.resourceRevision",
+    )
+
+
+def proposal_safe_summary(proposal: dict) -> str:
+    action_type = proposal.get("actionType")
+    if action_type == "insert_text":
+        return "Insert text proposal"
+    return "Replace text proposal"
 
 
 async def _aiter(value: Any) -> Any:

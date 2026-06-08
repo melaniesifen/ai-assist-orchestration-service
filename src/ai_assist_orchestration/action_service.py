@@ -21,6 +21,13 @@ SAFE_CONFLICT_DETAIL_KEYS = frozenset(
         "targetRangeId",
     }
 )
+ACTION_EVENT_PROPOSED_REASON = "ACTION_PROPOSED"
+ACTION_EVENT_EXPIRED_REASON = "ACTION_EXPIRED"
+DEFAULT_ACTION_SUMMARY_BY_TYPE = {
+    "replace_text": "Replace text proposal",
+    "insert_text": "Insert text proposal",
+}
+SUPPORTED_ACTION_TYPES = frozenset(DEFAULT_ACTION_SUMMARY_BY_TYPE)
 
 
 class ActionService:
@@ -70,22 +77,27 @@ class ActionService:
             "createdAt": isoformat_z(now),
             "updatedAt": isoformat_z(now),
             "expiresAt": expires_at,
-            "summary": require_non_blank_string(input_data.get("summary"), "input.summary"),
+            "summary": require_non_blank_string(
+                input_data.get("summary") or DEFAULT_ACTION_SUMMARY_BY_TYPE.get(input_data.get("actionType")),
+                "input.summary",
+            ),
         }
+        require_supported_action_type(action["actionType"])
+        require_action_target(action)
         if self.action_store.get(action_id):
             raise conflict_error("ACTION_ID_COLLISION", "Generated action ID already exists", {"actionId": action_id})
         created = self.action_store.create(action)
-        await self._publish_status(created, None, ACTION_STATUS.PROPOSED.value, "ACTION_PROPOSED")
         await maybe_await(
             self.event_publisher.publish(
                 {
                     "type": "action.proposed",
                     "actionId": created["actionId"],
                     "sessionId": created["sessionId"],
-                    "resourceId": created["resourceId"],
                     "actionType": created["actionType"],
+                    "resourceRef": {"provider": created["provider"], "resourceId": created["resourceId"]},
                     "summary": created["summary"],
                     "expiresAt": created["expiresAt"],
+                    **request_event_context(input_data),
                 }
             )
         )
@@ -94,8 +106,12 @@ class ActionService:
     async def approve_action(self, identity: dict, input_data: dict) -> dict:
         input_data = require_object(input_data, "input")
         event_context = request_event_context(input_data)
-        action = self._get_owned_action(identity, input_data.get("actionId"))
+        action = self._get_authorized_action(identity, input_data)
         require_action_status(action)
+        expired = await self._expire_action_if_needed(action, event_context)
+        if expired["expired"]:
+            return expired["action"]
+        action = expired["action"]
         if action["status"] == ACTION_STATUS.APPROVED.value:
             return action
         if action["status"] != ACTION_STATUS.PROPOSED.value:
@@ -117,8 +133,12 @@ class ActionService:
     async def reject_action(self, identity: dict, input_data: dict) -> dict:
         input_data = require_object(input_data, "input")
         event_context = request_event_context(input_data)
-        action = self._get_owned_action(identity, input_data.get("actionId"))
+        action = self._get_authorized_action(identity, input_data)
         require_action_status(action)
+        expired = await self._expire_action_if_needed(action, event_context)
+        if expired["expired"]:
+            return expired["action"]
+        action = expired["action"]
         if is_terminal_action_status(action["status"]):
             return action
         reason_code = input_data.get("reasonCode", "USER_REJECTED")
@@ -150,7 +170,7 @@ class ActionService:
         input_data = require_object(input_data, "input")
         event_context = request_event_context(input_data)
         idempotency_key = require_non_blank_string(input_data.get("idempotencyKey"), "idempotencyKey")
-        action = self._get_owned_action(identity, input_data.get("actionId"))
+        action = self._get_authorized_action(identity, input_data)
         require_action_status(action)
         if action.get("applyResult") and action.get("idempotencyKey") == idempotency_key:
             return action["applyResult"]
@@ -162,15 +182,10 @@ class ActionService:
                 "Action must be approved before apply",
                 {"actionId": action["actionId"], "status": action["status"]},
             )
-        if is_expired(action, epoch_ms(self.clock())):
-            expired = self._transition(
-                action,
-                ACTION_STATUS.EXPIRED.value,
-                {"expiredAt": isoformat_z(self.clock()), "reasonCode": "ACTION_EXPIRED", "idempotencyKey": idempotency_key},
-            )
-            if expired["transitioned"]:
-                await self._publish_status(expired["action"], action["status"], expired["action"]["status"], "ACTION_EXPIRED", event_context)
+        expired = await self._expire_action_if_needed(action, event_context, idempotency_key=idempotency_key)
+        if expired["expired"]:
             return terminal_result(expired["action"])
+        action = expired["action"]
 
         consent = await maybe_await(
             self.consent_service.validate_apply_consent(
@@ -276,15 +291,52 @@ class ActionService:
         await self._publish_status(applied, action["status"], applied["status"], "APPLY_SUCCEEDED", event_context)
         return applied["applyResult"]
 
-    def _get_owned_action(self, identity: dict, action_id: Any) -> dict:
+    def _get_authorized_action(self, identity: dict, input_data: dict) -> dict:
         assert_identity(identity)
-        action_id = require_non_blank_string(action_id, "actionId")
+        action_id = require_non_blank_string(input_data.get("actionId"), "actionId")
         action = self.action_store.get(action_id)
         if not action:
             raise validation_error("ACTION_NOT_FOUND", "Action was not found", {"actionId": action_id})
         if not assert_ownership(identity, action):
             raise authorization_error("ACTION_FORBIDDEN", "Action is not accessible to this identity", {"actionId": action_id})
+        expected_session_id = require_non_blank_string(input_data.get("sessionId"), "input.sessionId")
+        expected_resource_id = require_non_blank_string(input_data.get("resourceId"), "input.resourceId")
+        if action.get("sessionId") != expected_session_id:
+            raise authorization_error("ACTION_FORBIDDEN", "Action is not accessible for this session", {"actionId": action_id})
+        if action.get("resourceId") != expected_resource_id:
+            raise authorization_error("ACTION_FORBIDDEN", "Action is not accessible for this resource", {"actionId": action_id})
         return action
+
+    async def _expire_action_if_needed(
+        self,
+        action: dict,
+        event_context: dict | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        if action["status"] == ACTION_STATUS.EXPIRED.value:
+            return {"expired": True, "action": action}
+        if is_terminal_action_status(action["status"]) or not is_expired(action, epoch_ms(self.clock())):
+            return {"expired": False, "action": action}
+        now = isoformat_z(self.clock())
+        result = self.action_store.transition(
+            action["actionId"],
+            allowed_statuses={ACTION_STATUS.PROPOSED.value, ACTION_STATUS.APPROVED.value},
+            patch={
+                "status": ACTION_STATUS.EXPIRED.value,
+                "expiredAt": now,
+                "updatedAt": now,
+                "reasonCode": ACTION_EVENT_EXPIRED_REASON,
+                **({"idempotencyKey": idempotency_key} if idempotency_key is not None else {}),
+            },
+        )
+        if result["kind"] == "UPDATED":
+            await self._publish_status(result["action"], action["status"], result["action"]["status"], ACTION_EVENT_EXPIRED_REASON, event_context)
+            return {"expired": True, "action": result["action"]}
+        if result["kind"] == "STATUS_MISMATCH":
+            require_action_status(result["action"])
+            return {"expired": is_terminal_action_status(result["action"]["status"]), "action": result["action"]}
+        raise validation_error("ACTION_NOT_FOUND", "Action was not found", {"actionId": action["actionId"]})
 
     def _transition(self, action: dict, status: str, patch: dict) -> dict:
         result = self.action_store.transition(
@@ -339,6 +391,38 @@ def request_event_context(input_data: dict) -> dict:
     if isinstance(input_data.get("correlationId"), str) and input_data["correlationId"].strip():
         event_context["correlationId"] = input_data["correlationId"]
     return event_context
+
+
+def require_action_target(action: dict) -> None:
+    has_anchor = is_valid_target_anchor(action.get("targetAnchor"))
+    has_range = is_valid_target_range(action.get("targetRange"))
+    if not has_anchor and not has_range:
+        raise validation_error(
+            "INVALID_ACTION_TARGET",
+            "Action targetAnchor or targetRange is required and must be well formed",
+            {"fieldName": "input.targetAnchor"},
+        )
+
+
+def require_supported_action_type(action_type: str) -> None:
+    if action_type not in SUPPORTED_ACTION_TYPES:
+        raise validation_error(
+            "UNSUPPORTED_ACTION_TYPE",
+            "Action type is not supported for proposed actions",
+            {"actionType": action_type},
+        )
+
+
+def is_valid_target_anchor(value: Any) -> bool:
+    return isinstance(value, dict) and any(isinstance(item, str) and item.strip() for item in value.values())
+
+
+def is_valid_target_range(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    start = value.get("start")
+    end = value.get("end")
+    return isinstance(start, int) and isinstance(end, int) and start >= 0 and end > start
 
 
 def terminal_result(action: dict) -> dict:

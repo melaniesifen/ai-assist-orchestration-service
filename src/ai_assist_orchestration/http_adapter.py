@@ -55,6 +55,8 @@ class HttpCommandBoundary:
                 identity,
                 {
                     "actionId": body.get("actionId"),
+                    "sessionId": body.get("sessionId"),
+                    "resourceId": body.get("resourceId"),
                     "requestId": context.request_id,
                     "correlationId": context.correlation_id,
                 },
@@ -68,6 +70,8 @@ class HttpCommandBoundary:
                 identity,
                 {
                     "actionId": body.get("actionId"),
+                    "sessionId": body.get("sessionId"),
+                    "resourceId": body.get("resourceId"),
                     "reasonCode": body.get("reasonCode", "USER_REJECTED"),
                     "requestId": context.request_id,
                     "correlationId": context.correlation_id,
@@ -84,6 +88,8 @@ class HttpCommandBoundary:
                 context.identity,
                 {
                     "actionId": body.get("actionId"),
+                    "sessionId": body.get("sessionId"),
+                    "resourceId": body.get("resourceId"),
                     "idempotencyKey": require_idempotency_key(context.headers),
                     "requestId": context.request_id,
                     "correlationId": context.correlation_id,

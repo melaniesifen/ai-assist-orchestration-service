@@ -83,14 +83,20 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
             {
                 "auth": IDENTITY,
                 "headers": {"X-Request-Id": "req_approve", "X-Correlation-Id": "corr_action"},
-                "body": {"tenantId": "ignored", "userId": "ignored", "actionId": proposed["actionId"]},
+                "body": {
+                    "tenantId": "ignored",
+                    "userId": "ignored",
+                    "actionId": proposed["actionId"],
+                    "sessionId": "session_001",
+                    "resourceId": "doc_001",
+                },
             }
         )
         applied = await boundary.apply_action(
             {
                 "auth": IDENTITY,
                 "headers": {"Idempotency-Key": "idem_apply", "X-Request-Id": "req_apply", "X-Correlation-Id": "corr_action"},
-                "body": {"actionId": proposed["actionId"]},
+                "body": {"actionId": proposed["actionId"], "sessionId": "session_001", "resourceId": "doc_001"},
             }
         )
 
@@ -112,7 +118,14 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
             {
                 "auth": IDENTITY,
                 "headers": {"X-Request-Id": "req_reject", "X-Correlation-Id": "corr_reject"},
-                "body": {"tenantId": "ignored", "userId": "ignored", "actionId": "action_001", "reasonCode": "USER_CANCELLED"},
+                "body": {
+                    "tenantId": "ignored",
+                    "userId": "ignored",
+                    "actionId": "action_001",
+                    "sessionId": "session_001",
+                    "resourceId": "doc_001",
+                    "reasonCode": "USER_CANCELLED",
+                },
             }
         )
 
@@ -229,6 +242,181 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[4]["usage"], {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5})
         self.assertEqual(observed_provider_request["context"]["contextMode"], "SELECTION")
         self.assertTrue(observed_provider_request["context"]["provenance"]["connectorVerified"])
+
+    async def test_provider_proposal_output_creates_server_owned_actions_and_safe_events(self) -> None:
+        events = []
+        action_store = InMemoryActionStore()
+        action_service = create_test_action_service(
+            action_store=action_store,
+            events=events,
+            connector=RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "google_op_001"}),
+            id_generator=lambda _prefix: "action_from_provider",
+        )
+
+        class ProposalProvider:
+            async def stream(self, _request):
+                yield {"type": "assistant.delta", "delta": "Proposal ready."}
+                yield {
+                    "type": "assistant.final",
+                    "finishReason": "stop",
+                    "proposals": [
+                        {
+                            "proposalId": "proposal_001",
+                            "actionId": "caller_must_not_win",
+                            "actionType": "replace_text",
+                            "currentText": "plain old text",
+                            "proposedText": "plain new text",
+                            "surroundingText": "plain surrounding text",
+                            "rationale": "Improve clarity",
+                            "targetHint": {
+                                "originalTextHash": "sha256:from-provider",
+                                "targetRange": {"start": 5, "end": 9},
+                            },
+                        }
+                    ],
+                }
+
+        service = create_command_service(
+            clock=lambda: NOW,
+            policy_service=SimplePolicy({"decision": "ALLOW"}),
+            context_service=SimpleContext(
+                {
+                    "authorized": True,
+                    "resourceRef": {"provider": "google_docs", "resourceId": "doc_from_context"},
+                    "provenance": {"resourceVersion": "rev_from_context"},
+                }
+            ),
+            provider_registry={"openai": ProposalProvider()},
+            prompt_builder=SimplePromptBuilder(),
+            event_publisher=Publisher(events),
+            action_service=action_service,
+        )
+
+        result = await service.run_assistant_command(IDENTITY, base_command_input())
+
+        self.assertEqual(result["proposedActionIds"], ["action_from_provider"])
+        persisted = action_store.get("action_from_provider")
+        self.assertEqual(persisted["tenantId"], IDENTITY["tenantId"])
+        self.assertEqual(persisted["userId"], IDENTITY["userId"])
+        self.assertEqual(persisted["sessionId"], "session_001")
+        self.assertEqual(persisted["provider"], "google_docs")
+        self.assertEqual(persisted["resourceId"], "doc_from_context")
+        self.assertEqual(persisted["resourceRevision"], "rev_from_context")
+        self.assertEqual(persisted["status"], ACTION_STATUS.PROPOSED.value)
+        self.assertEqual(persisted["actionId"], "action_from_provider")
+        self.assertNotIn("plain old text", str(persisted["encryptedPayload"]))
+        self.assertNotIn("plain new text", str(persisted["encryptedPayload"]))
+
+        proposed_event = next(event for event in events if event["type"] == "action.proposed")
+        self.assertEqual(proposed_event["resourceRef"], {"provider": "google_docs", "resourceId": "doc_from_context"})
+        self.assertEqual(proposed_event["requestId"], "req_001")
+        self.assertEqual(proposed_event["correlationId"], "corr_001")
+        self.assertNotIn("plain old text", str(proposed_event))
+        self.assertNotIn("plain new text", str(proposed_event))
+
+    async def test_provider_proposal_batch_validation_rejects_unsafe_batches_before_persistence(self) -> None:
+        cases = [
+            (
+                "unsupported action",
+                [
+                    {
+                        "actionType": "rewrite_document",
+                        "targetRange": {"start": 1, "end": 3},
+                        "originalTextHash": "sha256:one",
+                    }
+                ],
+                "UNSUPPORTED_ACTION_TYPE",
+            ),
+            (
+                "malformed target",
+                [
+                    {
+                        "actionType": "replace_text",
+                        "targetRange": {"start": 5, "end": 5},
+                        "originalTextHash": "sha256:one",
+                    }
+                ],
+                "INVALID_ACTION_TARGET",
+            ),
+            (
+                "overlapping ranges",
+                [
+                    {
+                        "proposalId": "proposal_001",
+                        "actionType": "replace_text",
+                        "targetRange": {"start": 1, "end": 5},
+                        "originalTextHash": "sha256:one",
+                    },
+                    {
+                        "proposalId": "proposal_002",
+                        "actionType": "replace_text",
+                        "targetRange": {"start": 4, "end": 8},
+                        "originalTextHash": "sha256:two",
+                    },
+                ],
+                "OVERLAPPING_ACTION_TARGETS",
+            ),
+            (
+                "valid then invalid",
+                [
+                    {
+                        "proposalId": "proposal_001",
+                        "actionType": "replace_text",
+                        "targetRange": {"start": 1, "end": 3},
+                        "originalTextHash": "sha256:one",
+                    },
+                    {
+                        "proposalId": "proposal_002",
+                        "actionType": "replace_text",
+                        "targetRange": {"start": 9, "end": 12},
+                    },
+                ],
+                "INVALID_FIELD",
+            ),
+        ]
+
+        for name, proposals, error_code in cases:
+            with self.subTest(name=name):
+                events = []
+                action_store = InMemoryActionStore()
+                service = create_command_with_proposal_provider(action_store=action_store, events=events, proposals=proposals)
+
+                with self.assertRaises(OrchestrationError) as caught:
+                    await service.run_assistant_command(IDENTITY, base_command_input())
+
+                self.assertEqual(caught.exception.code, error_code)
+                self.assertIsNone(action_store.get("action_001"))
+                self.assertFalse(any(event["type"] == "action.proposed" for event in events))
+
+    async def test_multiple_non_overlapping_provider_proposals_create_actions_after_batch_validation(self) -> None:
+        events = []
+        action_store = InMemoryActionStore()
+        service = create_command_with_proposal_provider(
+            action_store=action_store,
+            events=events,
+            proposals=[
+                {
+                    "proposalId": "proposal_001",
+                    "actionType": "replace_text",
+                    "targetRange": {"start": 1, "end": 3},
+                    "originalTextHash": "sha256:one",
+                },
+                {
+                    "proposalId": "proposal_002",
+                    "actionType": "replace_text",
+                    "targetRange": {"start": 6, "end": 9},
+                    "originalTextHash": "sha256:two",
+                },
+            ],
+            id_generator=CountingIdGenerator(),
+        )
+
+        result = await service.run_assistant_command(IDENTITY, base_command_input())
+
+        self.assertEqual(result["proposedActionIds"], ["action_001", "action_002"])
+        self.assertEqual(action_store.get("action_001")["status"], ACTION_STATUS.PROPOSED.value)
+        self.assertEqual(action_store.get("action_002")["status"], ACTION_STATUS.PROPOSED.value)
+        self.assertEqual(len([event for event in events if event["type"] == "action.proposed"]), 2)
 
     async def test_context_failures_publish_safe_error_event(self) -> None:
         events = []
@@ -393,18 +581,42 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proposed["status"], ACTION_STATUS.PROPOSED.value)
         self.assertEqual(proposed["actionId"], "action_001")
 
-        approved = await service.approve_action(IDENTITY, {"actionId": proposed["actionId"]})
+        approved = await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
         self.assertEqual(approved["status"], ACTION_STATUS.APPROVED.value)
 
-        first_apply = await service.apply_action(IDENTITY, {"actionId": proposed["actionId"], "idempotencyKey": "idem_001"})
-        replayed_apply = await service.apply_action(IDENTITY, {"actionId": proposed["actionId"], "idempotencyKey": "idem_001"})
-        terminal_apply = await service.apply_action(IDENTITY, {"actionId": proposed["actionId"], "idempotencyKey": "idem_002"})
+        first_apply = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_001"))
+        replayed_apply = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_001"))
+        terminal_apply = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_002"))
 
         self.assertEqual(connector.write_count, 1)
         self.assertEqual(replayed_apply, first_apply)
         self.assertEqual(terminal_apply["status"], ACTION_STATUS.APPLIED.value)
         self.assertEqual(action_store.get(proposed["actionId"])["status"], ACTION_STATUS.APPLIED.value)
         self.assertTrue(any(event["type"] == "action.status_changed" and event["status"] == ACTION_STATUS.APPLIED.value for event in events))
+
+    async def test_approve_and_reject_lifecycle_decisions_are_deterministic(self) -> None:
+        events = []
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            events=events,
+            connector=RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "google_op_001"}),
+        )
+
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+        first_approve = await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+        second_approve = await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+        first_reject = await service.reject_action(IDENTITY, action_decision_input(proposed["actionId"], reasonCode="USER_REJECTED"))
+        second_reject = await service.reject_action(IDENTITY, action_decision_input(proposed["actionId"], reasonCode="USER_REJECTED"))
+
+        self.assertEqual(first_approve["status"], ACTION_STATUS.APPROVED.value)
+        self.assertEqual(second_approve, first_approve)
+        self.assertEqual(first_reject["status"], ACTION_STATUS.REJECTED.value)
+        self.assertEqual(second_reject, first_reject)
+        approved_events = [event for event in events if event.get("status") == ACTION_STATUS.APPROVED.value]
+        rejected_events = [event for event in events if event.get("status") == ACTION_STATUS.REJECTED.value]
+        self.assertEqual(len(approved_events), 1)
+        self.assertEqual(len(rejected_events), 1)
 
     async def test_uses_server_owned_action_ids_and_clamps_caller_supplied_ttls(self) -> None:
         service = create_test_action_service(
@@ -419,6 +631,97 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(proposed["actionId"], "action_001")
         self.assertEqual(proposed["expiresAt"], "2026-05-30T00:00:00.000Z")
+
+    async def test_decision_commands_deny_cross_tenant_user_session_and_resource_scope(self) -> None:
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            connector=RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "google_op_001"}),
+        )
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+
+        denial_cases = [
+            ({"tenantId": "tenant_other", "userId": IDENTITY["userId"]}, action_decision_input(proposed["actionId"])),
+            ({"tenantId": IDENTITY["tenantId"], "userId": "user_other"}, action_decision_input(proposed["actionId"])),
+            (IDENTITY, action_decision_input(proposed["actionId"], sessionId="session_other")),
+            (IDENTITY, action_decision_input(proposed["actionId"], resourceId="doc_other")),
+        ]
+        for denied_identity, denied_input in denial_cases:
+            with self.subTest(denied_identity=denied_identity, denied_input=denied_input):
+                with self.assertRaises(OrchestrationError) as caught:
+                    await service.approve_action(denied_identity, denied_input)
+                self.assertEqual(caught.exception.category, "AUTHORIZATION")
+
+        self.assertEqual(action_store.get(proposed["actionId"])["status"], ACTION_STATUS.PROPOSED.value)
+
+    async def test_decision_commands_require_session_and_resource_scope(self) -> None:
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            connector=RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "google_op_001"}),
+        )
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+
+        for method, scoped_input in (
+            (service.approve_action, {"actionId": proposed["actionId"], "resourceId": "doc_001"}),
+            (service.reject_action, {"actionId": proposed["actionId"], "sessionId": "session_001"}),
+            (service.apply_action, {"actionId": proposed["actionId"], "idempotencyKey": "idem_missing_scope", "sessionId": "session_001"}),
+        ):
+            with self.subTest(method=method.__name__):
+                with self.assertRaises(OrchestrationError) as caught:
+                    await method(IDENTITY, scoped_input)
+                self.assertEqual(caught.exception.category, "VALIDATION")
+
+        self.assertEqual(action_store.get(proposed["actionId"])["status"], ACTION_STATUS.PROPOSED.value)
+
+    async def test_stale_approval_or_rejection_expires_action_without_connector_mutation(self) -> None:
+        events = []
+        action_store = InMemoryActionStore()
+        connector = RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "should_not_happen"})
+        service = create_test_action_service(
+            action_store=action_store,
+            events=events,
+            connector=connector,
+        )
+        proposed = await service.create_proposed_action(IDENTITY, {**base_action_input(), "ttlMs": 1})
+        action_store.update(proposed["actionId"], lambda current: {**current, "expiresAt": "2026-05-28T23:59:59.000Z"})
+
+        approved = await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+        rejected = await service.reject_action(IDENTITY, action_decision_input(proposed["actionId"]))
+
+        self.assertEqual(approved["status"], ACTION_STATUS.EXPIRED.value)
+        self.assertEqual(rejected["status"], ACTION_STATUS.EXPIRED.value)
+        self.assertEqual(connector.write_count, 0)
+        expired_events = [event for event in events if event.get("status") == ACTION_STATUS.EXPIRED.value]
+        self.assertEqual(len(expired_events), 1)
+
+    async def test_action_events_and_fake_encryption_boundary_exclude_payload_plaintext(self) -> None:
+        events = []
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            events=events,
+            connector=RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "google_op_001"}),
+        )
+
+        proposed = await service.create_proposed_action(
+            IDENTITY,
+            {
+                **base_action_input(),
+                "payload": {
+                    "currentText": "sensitive current document text",
+                    "proposedText": "sensitive proposed document text",
+                },
+            },
+        )
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+
+        persisted = action_store.get(proposed["actionId"])
+        self.assertEqual(persisted["encryptedPayload"], {"ciphertextRef": "encrypted_payload_1"})
+        self.assertNotIn("sensitive current document text", str(persisted))
+        self.assertNotIn("sensitive proposed document text", str(persisted))
+        self.assertNotIn("sensitive current document text", str(events))
+        self.assertNotIn("sensitive proposed document text", str(events))
 
     async def test_marks_stale_action_state_conflicted_and_performs_no_provider_mutation(self) -> None:
         action_store = InMemoryActionStore()
@@ -441,8 +744,8 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         proposed = await service.create_proposed_action(IDENTITY, base_action_input())
-        await service.approve_action(IDENTITY, {"actionId": proposed["actionId"]})
-        result = await service.apply_action(IDENTITY, {"actionId": proposed["actionId"], "idempotencyKey": "idem_conflict"})
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+        result = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_conflict"))
 
         self.assertEqual(result["status"], ACTION_STATUS.CONFLICTED.value)
         self.assertEqual(result["reasonCode"], "ORIGINAL_TEXT_HASH_MISMATCH")
@@ -456,12 +759,12 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         action_store = InMemoryActionStore()
         service = create_test_action_service(action_store=action_store, connector=connector)
         proposed = await service.create_proposed_action(IDENTITY, base_action_input())
-        await service.approve_action(IDENTITY, {"actionId": proposed["actionId"]})
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
 
-        first = asyncio.create_task(service.apply_action(IDENTITY, {"actionId": proposed["actionId"], "idempotencyKey": "idem_concurrent"}))
+        first = asyncio.create_task(service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_concurrent")))
         await asyncio.sleep(0)
         with self.assertRaises(OrchestrationError) as caught:
-            await service.apply_action(IDENTITY, {"actionId": proposed["actionId"], "idempotencyKey": "idem_concurrent"})
+            await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_concurrent"))
         self.assertEqual(caught.exception.code, "ACTION_APPLY_IN_PROGRESS")
         gate.set()
         await first
@@ -493,7 +796,7 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         action_store.update(proposed["actionId"], lambda current: {**current, "status": "UNKNOWN"})
 
         with self.assertRaises(OrchestrationError) as caught:
-            await service.reject_action(IDENTITY, {"actionId": proposed["actionId"]})
+            await service.reject_action(IDENTITY, action_decision_input(proposed["actionId"]))
         self.assertEqual(caught.exception.category, "VALIDATION")
         self.assertEqual(caught.exception.code, "INVALID_ACTION_STATUS")
         self.assertEqual(caught.exception.metadata["actionId"], proposed["actionId"])
@@ -507,7 +810,7 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         proposed = await service.create_proposed_action(IDENTITY, base_action_input())
 
         with self.assertRaises(OrchestrationError) as caught:
-            await service.approve_action(IDENTITY, {"actionId": proposed["actionId"]})
+            await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
         self.assertEqual(caught.exception.code, "ACTION_NOT_APPROVABLE")
         self.assertEqual(action_store.get(proposed["actionId"])["status"], ACTION_STATUS.REJECTED.value)
 
@@ -516,12 +819,12 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         action_store = InMemoryActionStore()
         service = create_test_action_service(action_store=action_store, connector=BlockingConnector(gate))
         proposed = await service.create_proposed_action(IDENTITY, base_action_input())
-        await service.approve_action(IDENTITY, {"actionId": proposed["actionId"]})
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
 
-        first = asyncio.create_task(service.apply_action(IDENTITY, {"actionId": proposed["actionId"], "idempotencyKey": "idem_reject_race"}))
+        first = asyncio.create_task(service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_reject_race")))
         await asyncio.sleep(0)
         with self.assertRaises(OrchestrationError) as caught:
-            await service.reject_action(IDENTITY, {"actionId": proposed["actionId"]})
+            await service.reject_action(IDENTITY, action_decision_input(proposed["actionId"]))
         self.assertEqual(caught.exception.code, "ACTION_APPLY_IN_PROGRESS")
         gate.set()
         await first
@@ -543,10 +846,10 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         proposed = await service.create_proposed_action(IDENTITY, base_action_input())
-        await service.approve_action(IDENTITY, {"actionId": proposed["actionId"]})
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
 
-        first = await service.apply_action(IDENTITY, {"actionId": proposed["actionId"], "idempotencyKey": "idem_conflict_first"})
-        second = await service.apply_action(IDENTITY, {"actionId": proposed["actionId"], "idempotencyKey": "idem_conflict_second"})
+        first = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_conflict_first"))
+        second = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_conflict_second"))
 
         self.assertEqual(first, second)
         conflict_events = [
@@ -557,15 +860,39 @@ class OrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(conflict_events), 1)
 
 
-def create_test_action_service(*, action_store, connector, events=None):
+def create_test_action_service(*, action_store, connector, events=None, id_generator=None):
     return create_action_service(
         action_store=action_store,
         connector=connector,
         clock=lambda: NOW,
-        id_generator=lambda _prefix: "action_001",
+        id_generator=id_generator or (lambda _prefix: "action_001"),
         event_publisher=Publisher(events if events is not None else []),
         consent_service=ConsentService(),
         payload_vault=PayloadVault(),
+    )
+
+
+def create_command_with_proposal_provider(*, action_store, events, proposals, id_generator=None):
+    action_service = create_test_action_service(
+        action_store=action_store,
+        events=events,
+        connector=RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "google_op_001"}),
+        id_generator=id_generator,
+    )
+    return create_command_service(
+        clock=lambda: NOW,
+        policy_service=SimplePolicy({"decision": "ALLOW"}),
+        context_service=SimpleContext(
+            {
+                "authorized": True,
+                "resourceRef": {"provider": "google_docs", "resourceId": "doc_from_context"},
+                "provenance": {"resourceVersion": "rev_from_context"},
+            }
+        ),
+        provider_registry={"openai": ProposalProvider(proposals)},
+        prompt_builder=SimplePromptBuilder(),
+        event_publisher=Publisher(events),
+        action_service=action_service,
     )
 
 
@@ -582,6 +909,19 @@ def base_action_input():
         "payload": {"replacementText": "new text"},
         "summary": "Replace selected text",
     }
+
+
+def action_decision_input(action_id, **overrides):
+    return {
+        "actionId": action_id,
+        "sessionId": "session_001",
+        "resourceId": "doc_001",
+        **overrides,
+    }
+
+
+def action_apply_input(action_id, idempotency_key, **overrides):
+    return {**action_decision_input(action_id), "idempotencyKey": idempotency_key, **overrides}
 
 
 def base_command_input():
@@ -617,6 +957,25 @@ class FailingPublisher:
 class LegacyProvider:
     async def generate(self, _request):
         return {"messageId": "msg_001", "deltas": ["ok"], "finishReason": "stop", "usage": {}}
+
+
+class ProposalProvider:
+    def __init__(self, proposals):
+        self.proposals = proposals
+
+    async def stream(self, _request):
+        yield {"type": "assistant.delta", "delta": "Proposal ready."}
+        yield {"type": "assistant.final", "finishReason": "stop", "proposals": self.proposals}
+
+
+class CountingIdGenerator:
+    def __init__(self):
+        self.next_id = 1
+
+    def __call__(self, _prefix):
+        action_id = f"action_{self.next_id:03d}"
+        self.next_id += 1
+        return action_id
 
 
 class SimplePolicy:
@@ -656,11 +1015,18 @@ class ConsentService:
 
 
 class PayloadVault:
+    def __init__(self):
+        self.payloads = {}
+        self.next_id = 1
+
     async def encrypt(self, payload):
-        return {"ciphertextRef": "encrypted_payload_001", "payload": payload}
+        ciphertext_ref = f"encrypted_payload_{self.next_id}"
+        self.next_id += 1
+        self.payloads[ciphertext_ref] = payload
+        return {"ciphertextRef": ciphertext_ref}
 
     async def decrypt(self, encrypted_payload):
-        return encrypted_payload["payload"]
+        return self.payloads[encrypted_payload["ciphertextRef"]]
 
 
 class RecordingConnector:

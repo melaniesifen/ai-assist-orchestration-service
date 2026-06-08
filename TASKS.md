@@ -30,6 +30,14 @@ Relevant LLDs:
 - [x] REPO-002: Migrate orchestration service to a Python package layout with equivalent command coordination, proposed-action lifecycle, policy/provider/context/event boundaries, tests, coverage workflow, and repo docs.
 - [x] Repo layout: standardize the Python package under `src/ai_assist_orchestration/` and document `PYTHONPATH=src` unittest and compile checks.
 
+## Completed M6 Local Tasks
+
+- [x] M6-T2: Convert provider proposal output into server-owned proposed actions with server-generated IDs.
+- [x] M6-T2: Verify approve, reject, duplicate decision, and stale expiry lifecycle transitions.
+- [x] M6-T2: Verify tenant, user, session, and resource scoped action authorization.
+- [x] M6-T2: Verify the fake encryption boundary and metadata-only action event payloads.
+- [x] M6-T2: Publish `action.proposed` and `action.status_changed` calls from orchestration action lifecycle paths.
+
 ## Architecture Tasks Pending
 
 - Approved direction: migrate from the temporary Node.js ESM bootstrap to Python initially. Revisit Java only if long-running workflow throughput or typed domain needs justify it.
