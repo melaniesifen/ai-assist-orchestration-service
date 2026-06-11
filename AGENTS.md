@@ -14,6 +14,7 @@
 - Apply-action must be authenticated, authorized, idempotent, and conflict-safe.
 - Add tests for command validation, policy deny, provider failures, action lifecycle, duplicate apply, stale conflict no-mutation behavior, and event publication.
 - Runtime code is Python and should remain dependency-light until a production HTTP framework or adapter dependency is selected.
+- Keep tests mirrored to source responsibilities where practical, and put reused fakes, constants, fixtures, or assertions in `tests/common.py`.
 
 ## Commands
 
