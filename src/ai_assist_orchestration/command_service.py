@@ -22,6 +22,8 @@ SUPPORTED_PROPOSAL_ACTION_TYPES = frozenset({ACTION_TYPE_INSERT_TEXT, ACTION_TYP
 ERROR_CODE_CONTEXT_UNAVAILABLE = "CONTEXT_UNAVAILABLE"
 ERROR_CODE_EVENT_PUBLISH_FAILED = "EVENT_PUBLISH_FAILED"
 ERROR_CODE_PROVIDER_STREAM_FAILED = "PROVIDER_STREAM_FAILED"
+PROVIDER_ACCESS_SOURCE_PLATFORM = "platform"
+PROVIDER_ACCESS_SOURCE_BYO = "byo"
 
 PROVIDER_ERROR_CATEGORY_MAP = {
     "authentication": "AUTHENTICATION",
@@ -139,7 +141,7 @@ class CommandService:
         provider_request = {
             "prompt": prompt,
             "context": context,
-            "secretRef": command.get("secretRef"),
+            "providerAccess": provider_access_for_command(command),
             "requestId": request_id,
             "correlationId": correlation_id,
         }
@@ -503,6 +505,25 @@ def proposal_safe_summary(proposal: dict) -> str:
     if action_type == "insert_text":
         return "Insert text proposal"
     return "Replace text proposal"
+
+
+def provider_access_for_command(command: dict) -> dict:
+    access = command.get("providerAccess") if isinstance(command.get("providerAccess"), Mapping) else {}
+    source = access.get("source")
+    if source == PROVIDER_ACCESS_SOURCE_PLATFORM:
+        return {
+            "source": PROVIDER_ACCESS_SOURCE_PLATFORM,
+            "reference": access.get("reference"),
+        }
+    if source == PROVIDER_ACCESS_SOURCE_BYO or command.get("secretRef"):
+        return {
+            "source": PROVIDER_ACCESS_SOURCE_BYO,
+            "secretRef": access.get("secretRef") or command.get("secretRef"),
+        }
+    return {
+        "source": PROVIDER_ACCESS_SOURCE_PLATFORM,
+        "reference": access.get("reference"),
+    }
 
 
 async def _aiter(value: Any) -> Any:

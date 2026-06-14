@@ -24,6 +24,7 @@ Relevant LLDs:
 - [x] EVT-004: Use an injected event publisher boundary for progress, assistant, action proposed, and action status events.
 - [x] SAFE-002: Call an injected policy decision boundary before provider generation.
 - [x] PROVIDER-004: Require explicit provider selection through the provider registry; unsupported providers fail with a typed validation error.
+- [x] PROVIDER-004: Default provider handoff to platform-owned provider access metadata and use BYO secret references only when explicitly configured.
 - [x] Add unit tests for command coordination, policy deny, unsupported providers, action lifecycle, idempotent apply, stale conflict, concurrent apply reservation, typed validation, and safe conflict metadata.
 - [x] Document test and coverage commands in `README.md`.
 - [x] Ignore local prompts, feedback, coverage output, dependencies, and build artifacts.
@@ -71,6 +72,7 @@ Relevant LLDs:
 - [ ] E2E-003: Validate proposed action creation, review, approval/rejection, ownership protection, encrypted payload storage, and action proposed events.
 - [ ] E2E-004: Validate safe apply-action against Google Docs adapter with consent, revision/range/hash checks, idempotency, and conflict handling.
 - [ ] E2E-005: Verify orchestration logs exclude raw prompts, document text, model responses, secrets, and action payload plaintext.
+- [x] M8-T4.6: Provider handoff tests verify default platform access and optional BYO secret-reference access without raw credentials.
 - [ ] Define deployment pipeline checks for contract compatibility, HTTP command routes, environment config, and required dependency endpoints.
 - [ ] Add failure-mode validation for event publisher outage, policy dependency failure, provider timeout, KMS decrypt failure, stale action conflicts, and missing consent.
 

@@ -118,7 +118,10 @@ class CommandServiceTests(unittest.IsolatedAsyncioTestCase):
             event_publisher=Publisher(events),
         )
 
-        result = await service.run_assistant_command(IDENTITY, base_command_input())
+        command = base_command_input()
+        command.pop("secretRef", None)
+
+        result = await service.run_assistant_command(IDENTITY, command)
 
         self.assertEqual(result, {"messageId": "msg_req_001", "finishReason": "stop", "provider": "openai"})
         self.assertEqual([event["type"] for event in events], ["progress", "progress", "assistant.delta", "assistant.delta", "assistant.final"])
@@ -128,6 +131,36 @@ class CommandServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[4]["usage"], {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5})
         self.assertEqual(observed_provider_request["context"]["contextMode"], "SELECTION")
         self.assertTrue(observed_provider_request["context"]["provenance"]["connectorVerified"])
+        self.assertEqual(observed_provider_request["providerAccess"], {"source": "platform", "reference": None})
+        self.assertNotIn("secretRef", observed_provider_request)
+
+    async def test_provider_handoff_uses_optional_byo_secret_reference_only_when_explicit(self) -> None:
+        observed_provider_request = {}
+
+        class StreamProvider:
+            async def stream(self, request):
+                observed_provider_request.update(request)
+                yield {"type": "assistant.final", "finishReason": "stop"}
+
+        service = create_command_service(
+            clock=lambda: NOW,
+            policy_service=SimplePolicy({"decision": "ALLOW", "decisionId": "pol_byo"}),
+            context_service=SimpleContext({"authorized": True}),
+            provider_registry={"openai": StreamProvider()},
+            prompt_builder=SimplePromptBuilder(),
+            event_publisher=Publisher([]),
+        )
+
+        await service.run_assistant_command(
+            IDENTITY,
+            {
+                **base_command_input(),
+                "secretRef": "secret_001",
+            },
+        )
+
+        self.assertEqual(observed_provider_request["providerAccess"], {"source": "byo", "secretRef": "secret_001"})
+        self.assertNotIn("credential", observed_provider_request)
 
     async def test_provider_proposal_output_creates_server_owned_actions_and_safe_events(self) -> None:
         events = []
@@ -456,4 +489,3 @@ class CommandServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.category, "VALIDATION")
         self.assertEqual(caught.exception.status_code, 400)
         self.assertEqual(caught.exception.metadata["fieldName"], "command.requestId")
-
