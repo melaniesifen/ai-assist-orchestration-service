@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterable, Iterable, Mapping
 from typing import Any, Callable
+from uuid import uuid4
 
 from .async_utils import maybe_await
 from .errors import OrchestrationError, dependency_error, policy_error, validation_error
@@ -59,6 +60,7 @@ class CommandService:
         prompt_builder: Any,
         action_service: Any | None = None,
         clock: Callable[[], Any] = utc_now,
+        event_id_generator: Callable[[], str] | None = None,
     ) -> None:
         if not context_service or provider_registry is None or not event_publisher or not policy_service or not prompt_builder:
             raise TypeError("context_service, provider_registry, event_publisher, policy_service, and prompt_builder are required")
@@ -69,6 +71,8 @@ class CommandService:
         self.prompt_builder = prompt_builder
         self.action_service = action_service
         self.clock = clock
+        self.event_id_generator = event_id_generator or (lambda: f"evt_{uuid4().hex}")
+        self._event_sequence = 0
 
     async def run_assistant_command(self, identity: dict, command: dict) -> dict:
         assert_identity(identity)
@@ -105,7 +109,7 @@ class CommandService:
         if provider is None:
             raise validation_error("PROVIDER_UNSUPPORTED", "Provider is not configured", {"provider": provider_name})
 
-        await self._publish_progress(session_id, request_id, correlation_id, "context.loading", "started")
+        await self._publish_progress(identity, session_id, request_id, correlation_id, "context.loading", "started")
         try:
             context = await maybe_await(
                 self.context_service.resolve_context(
@@ -125,7 +129,7 @@ class CommandService:
                     {"sessionId": session_id, "reasonCode": (context or {}).get("reasonCode", ERROR_CODE_CONTEXT_UNAVAILABLE)},
                 )
         except OrchestrationError as error:
-            await self._publish_error(session_id, request_id, correlation_id, error)
+            await self._publish_error(identity, session_id, request_id, correlation_id, error)
             raise
         except Exception as error:
             safe_error = dependency_error(
@@ -133,10 +137,10 @@ class CommandService:
                 "Context could not be resolved for this command",
                 {"sessionId": session_id, "dependencyStatus": "failed", "dependency": "context"},
             )
-            await self._publish_error(session_id, request_id, correlation_id, safe_error)
+            await self._publish_error(identity, session_id, request_id, correlation_id, safe_error)
             raise safe_error from error
 
-        await self._publish_progress(session_id, request_id, correlation_id, "provider.generating", "in_progress")
+        await self._publish_progress(identity, session_id, request_id, correlation_id, "provider.generating", "in_progress")
         prompt = await maybe_await(self.prompt_builder.build_prompt({"command": command, "context": context}))
         provider_request = {
             "prompt": prompt,
@@ -153,13 +157,13 @@ class CommandService:
                 if provider_event.get("type") == EVENT_TYPE_ASSISTANT_DELTA:
                     provider_event.setdefault("messageId", message_id)
                     provider_event.setdefault("index", delta_index)
-                    await self._publish_assistant_delta(session_id, request_id, correlation_id, provider_event)
+                    await self._publish_assistant_delta(identity, session_id, request_id, correlation_id, provider_event)
                     delta_index += 1
                     continue
                 if provider_event.get("type") == EVENT_TYPE_ASSISTANT_FINAL:
                     provider_event.setdefault("messageId", message_id)
                     final_event = provider_event
-                    await self._publish_assistant_final(session_id, request_id, correlation_id, provider_event)
+                    await self._publish_assistant_final(identity, session_id, request_id, correlation_id, provider_event)
                     continue
                 if provider_event.get("type") == EVENT_TYPE_ERROR:
                     error = self._provider_event_error(provider_event, session_id)
@@ -179,7 +183,7 @@ class CommandService:
             )
         except OrchestrationError as error:
             if error.code != ERROR_CODE_EVENT_PUBLISH_FAILED:
-                await self._publish_error(session_id, request_id, correlation_id, error)
+                await self._publish_error(identity, session_id, request_id, correlation_id, error)
             raise
         except Exception as error:
             safe_error = dependency_error(
@@ -187,7 +191,7 @@ class CommandService:
                 "Provider stream failed for this command",
                 {"sessionId": session_id, "provider": provider_name, "dependencyStatus": "failed"},
             )
-            await self._publish_error(session_id, request_id, correlation_id, safe_error)
+            await self._publish_error(identity, session_id, request_id, correlation_id, safe_error)
             raise safe_error from error
 
         return {
@@ -224,7 +228,7 @@ class CommandService:
             resource_revision=resource_revision,
         )
 
-        await self._publish_progress(session_id, request_id, correlation_id, EVENT_TYPE_ACTION_CREATING_STAGE, "in_progress")
+        await self._publish_progress(identity, session_id, request_id, correlation_id, EVENT_TYPE_ACTION_CREATING_STAGE, "in_progress")
         created_actions = []
         for action_input in action_inputs:
             action = await maybe_await(
@@ -259,8 +263,9 @@ class CommandService:
             "usage": response.get("usage"),
         }
 
-    async def _publish_assistant_delta(self, session_id: str, request_id: str, correlation_id: str, event: dict) -> None:
+    async def _publish_assistant_delta(self, identity: dict, session_id: str, request_id: str, correlation_id: str, event: dict) -> None:
         await self._publish_event(
+            identity,
             {
                 "type": EVENT_TYPE_ASSISTANT_DELTA,
                 "sessionId": session_id,
@@ -272,8 +277,9 @@ class CommandService:
             }
         )
 
-    async def _publish_assistant_final(self, session_id: str, request_id: str, correlation_id: str, event: dict) -> None:
+    async def _publish_assistant_final(self, identity: dict, session_id: str, request_id: str, correlation_id: str, event: dict) -> None:
         await self._publish_event(
+            identity,
             {
                 "type": EVENT_TYPE_ASSISTANT_FINAL,
                 "sessionId": session_id,
@@ -286,8 +292,9 @@ class CommandService:
             }
         )
 
-    async def _publish_progress(self, session_id: str, request_id: str, correlation_id: str, stage: str, status: str) -> None:
+    async def _publish_progress(self, identity: dict, session_id: str, request_id: str, correlation_id: str, stage: str, status: str) -> None:
         await self._publish_event(
+            identity,
             {
                 "type": EVENT_TYPE_PROGRESS,
                 "sessionId": session_id,
@@ -299,8 +306,9 @@ class CommandService:
             }
         )
 
-    async def _publish_error(self, session_id: str, request_id: str, correlation_id: str, error: OrchestrationError) -> None:
+    async def _publish_error(self, identity: dict, session_id: str, request_id: str, correlation_id: str, error: OrchestrationError) -> None:
         await self._publish_event(
+            identity,
             {
                 "type": EVENT_TYPE_ERROR,
                 "sessionId": session_id,
@@ -314,9 +322,9 @@ class CommandService:
             }
         )
 
-    async def _publish_event(self, event: dict) -> None:
+    async def _publish_event(self, identity: dict, event: dict) -> None:
         try:
-            await maybe_await(self.event_publisher.publish(event))
+            await maybe_await(self.event_publisher.publish(self._session_event(identity, event)))
         except OrchestrationError as error:
             raise dependency_error(
                 ERROR_CODE_EVENT_PUBLISH_FAILED,
@@ -334,6 +342,22 @@ class CommandService:
                 "Session event could not be published",
                 {"eventType": event.get("type"), "sessionId": event.get("sessionId")},
             ) from error
+
+    def _session_event(self, identity: dict, event: dict) -> dict:
+        self._event_sequence += 1
+        payload = event_payload(event)
+        return {
+            **event,
+            "eventId": self.event_id_generator(),
+            "tenantId": identity["tenantId"],
+            "userId": identity["userId"],
+            "sessionId": event["sessionId"],
+            "requestId": event.get("requestId"),
+            "correlationId": event.get("correlationId"),
+            "sequence": self._event_sequence,
+            "createdAt": event.get("createdAt") or isoformat_z(self.clock()),
+            "payload": payload,
+        }
 
     def _provider_event_error(self, event: dict, session_id: str) -> OrchestrationError:
         raw_error = event.get("error") if isinstance(event.get("error"), Mapping) else {}
@@ -560,3 +584,8 @@ def _provider_error_category(category: Any) -> str:
         return "DEPENDENCY"
     normalized = category.strip()
     return PROVIDER_ERROR_CATEGORY_MAP.get(normalized.lower(), normalized.upper())
+
+
+def event_payload(event: dict) -> dict:
+    excluded = {"type", "tenantId", "userId", "sessionId", "requestId", "correlationId", "eventId", "sequence", "createdAt", "payload"}
+    return {key: value for key, value in event.items() if key not in excluded}

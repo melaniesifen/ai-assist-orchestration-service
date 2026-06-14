@@ -134,6 +134,34 @@ class CommandServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed_provider_request["providerAccess"], {"source": "platform", "reference": None})
         self.assertNotIn("secretRef", observed_provider_request)
 
+    async def test_published_command_events_include_session_event_envelope_fields(self) -> None:
+        events = []
+        event_ids = iter(["evt_001", "evt_002", "evt_003", "evt_004"])
+        service = create_command_service(
+            clock=lambda: NOW,
+            event_id_generator=lambda: next(event_ids),
+            policy_service=SimplePolicy({"decision": "ALLOW", "decisionId": "pol_envelope"}),
+            context_service=SimpleContext({"authorized": True}),
+            provider_registry={"openai": LegacyProvider()},
+            prompt_builder=SimplePromptBuilder(),
+            event_publisher=Publisher(events),
+        )
+
+        await service.run_assistant_command(IDENTITY, base_command_input())
+
+        self.assertEqual([event["eventId"] for event in events], ["evt_001", "evt_002", "evt_003", "evt_004"])
+        self.assertEqual([event["sequence"] for event in events], [1, 2, 3, 4])
+        for event in events:
+            self.assertEqual(event["tenantId"], IDENTITY["tenantId"])
+            self.assertEqual(event["userId"], IDENTITY["userId"])
+            self.assertEqual(event["sessionId"], "session_001")
+            self.assertEqual(event["requestId"], "req_001")
+            self.assertEqual(event["correlationId"], "corr_001")
+            self.assertIn("createdAt", event)
+            self.assertIsInstance(event["payload"], dict)
+            self.assertNotIn("tenantId", event["payload"])
+            self.assertNotIn("userId", event["payload"])
+
     async def test_provider_handoff_uses_optional_byo_secret_reference_only_when_explicit(self) -> None:
         observed_provider_request = {}
 

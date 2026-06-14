@@ -10,6 +10,7 @@ from common import (
     BlockingConnector,
     BlockingValidationConnector,
     ConsentService,
+    FailingPublisher,
     FailingPayloadVault,
     FailingValidationConnector,
     RecordingConnector,
@@ -174,6 +175,93 @@ class ActionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sensitive proposed document text", str(persisted))
         self.assertNotIn("sensitive current document text", str(events))
         self.assertNotIn("sensitive proposed document text", str(events))
+
+    async def test_action_events_include_session_event_envelope_fields(self) -> None:
+        events = []
+        event_ids = iter(["evt_proposed", "evt_approved"])
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            events=events,
+            connector=RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "google_op_001"}),
+        )
+        service.event_id_generator = lambda: next(event_ids)
+
+        proposed = await service.create_proposed_action(
+            IDENTITY,
+            {**base_action_input(), "requestId": "req_create", "correlationId": "corr_action"},
+        )
+        await service.approve_action(
+            IDENTITY,
+            action_decision_input(proposed["actionId"], requestId="req_approve", correlationId="corr_action"),
+        )
+
+        self.assertEqual([event["eventId"] for event in events], ["evt_proposed", "evt_approved"])
+        self.assertEqual([event["sequence"] for event in events], [1, 2])
+        self.assertEqual(events[0]["payload"]["actionId"], proposed["actionId"])
+        self.assertEqual(events[0]["payload"]["actionType"], "replace_text")
+        self.assertEqual(events[1]["payload"]["status"], ACTION_STATUS.APPROVED.value)
+        for event in events:
+            self.assertEqual(event["tenantId"], IDENTITY["tenantId"])
+            self.assertEqual(event["userId"], IDENTITY["userId"])
+            self.assertEqual(event["sessionId"], "session_001")
+            self.assertEqual(event["correlationId"], "corr_action")
+            self.assertIn("createdAt", event)
+            self.assertNotIn("tenantId", event["payload"])
+            self.assertNotIn("userId", event["payload"])
+
+    async def test_action_create_publisher_outage_preserves_durable_action_state(self) -> None:
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            events=[],
+            connector=RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "google_op_001"}),
+        )
+        service.event_publisher = FailingPublisher(fail_on_type="action.proposed")
+
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+
+        self.assertEqual(proposed["status"], ACTION_STATUS.PROPOSED.value)
+        self.assertEqual(proposed["eventPublishFailures"][0]["eventType"], "action.proposed")
+        persisted = action_store.get(proposed["actionId"])
+        self.assertEqual(persisted["status"], ACTION_STATUS.PROPOSED.value)
+        self.assertNotIn("eventPublishFailures", persisted)
+
+    async def test_action_status_publisher_outage_preserves_approve_state(self) -> None:
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(
+            action_store=action_store,
+            events=[],
+            connector=RecordingConnector({"valid": True, "verifiedTarget": {}}, {"providerOperationId": "google_op_001"}),
+        )
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+        service.event_publisher = FailingPublisher(fail_on_type="action.status_changed")
+
+        approved = await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+
+        self.assertEqual(approved["status"], ACTION_STATUS.APPROVED.value)
+        self.assertEqual(approved["eventPublishFailures"][0]["category"], "DEPENDENCY")
+        persisted = action_store.get(proposed["actionId"])
+        self.assertEqual(persisted["status"], ACTION_STATUS.APPROVED.value)
+        self.assertNotIn("eventPublishFailures", persisted)
+
+    async def test_apply_status_publisher_outage_preserves_apply_state_and_result(self) -> None:
+        connector = RecordingConnector({"valid": True, "verifiedTarget": {"revision": "rev_001"}}, {"providerOperationId": "google_op_001"})
+        action_store = InMemoryActionStore()
+        service = create_test_action_service(action_store=action_store, events=[], connector=connector)
+        proposed = await service.create_proposed_action(IDENTITY, base_action_input())
+        await service.approve_action(IDENTITY, action_decision_input(proposed["actionId"]))
+        service.event_publisher = FailingPublisher(fail_on_type="action.status_changed")
+
+        applied = await service.apply_action(IDENTITY, action_apply_input(proposed["actionId"], "idem_publish_outage"))
+
+        self.assertEqual(applied["status"], ACTION_STATUS.APPLIED.value)
+        self.assertEqual(applied["providerOperationId"], "google_op_001")
+        self.assertEqual(applied["eventPublishFailures"][0]["eventType"], "action.status_changed")
+        self.assertEqual(connector.write_count, 1)
+        persisted = action_store.get(proposed["actionId"])
+        self.assertEqual(persisted["status"], ACTION_STATUS.APPLIED.value)
+        self.assertNotIn("eventPublishFailures", persisted)
 
     async def test_marks_stale_action_state_conflicted_and_performs_no_provider_mutation(self) -> None:
         action_store = InMemoryActionStore()
@@ -417,5 +505,4 @@ class ActionServiceTests(unittest.IsolatedAsyncioTestCase):
             if event["type"] == "action.status_changed" and event["status"] == ACTION_STATUS.CONFLICTED.value
         ]
         self.assertEqual(len(conflict_events), 1)
-
 

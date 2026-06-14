@@ -46,6 +46,13 @@ Relevant LLDs:
 - [x] M7-T3: Verify revoked consent, reconnect-required token status, stale target, payload decrypt failure, and provider write failure paths skip connector mutation where safe.
 - [x] M7-T3: Verify successful apply, conflicted apply, failed apply, expired apply, same-key replay, different-key terminal replay, and `action.status_changed` publishing.
 
+## Completed M9 Local Tasks
+
+- [x] M9-T6: Verify framework-neutral HTTP command creation derives tenant/user identity server-side and propagates request/correlation IDs plus idempotency keys.
+- [x] M9-T6: Verify command orchestration resolves context/consent, uses platform provider access by default with optional BYO secret references, and emits SessionEvent-compatible progress/assistant/action events.
+- [x] M9-T6: Verify proposed-action creation, approve/reject, apply, idempotent replay, stale conflict, safe provider failure, and status events preserve M6/M7 lifecycle guarantees.
+- [x] M9-T6: Categorize action event publisher outages as metadata-only dependency failures without corrupting durable proposed-action state or requiring an open SSE connection to complete mutations.
+
 ## Architecture Tasks Pending
 
 - Approved direction: migrate from the temporary Node.js ESM bootstrap to Python initially. Revisit Java only if long-running workflow throughput or typed domain needs justify it.

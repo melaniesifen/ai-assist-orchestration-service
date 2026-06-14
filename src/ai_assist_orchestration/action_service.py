@@ -6,10 +6,13 @@ from uuid import uuid4
 
 from .action_model import ACTION_STATUS, DEFAULT_ACTION_TTL_MS, is_expired, is_known_action_status, is_terminal_action_status
 from .async_utils import maybe_await
-from .errors import authorization_error, conflict_error, dependency_error, validation_error
+from .errors import OrchestrationError, authorization_error, conflict_error, dependency_error, validation_error
 from .time_utils import epoch_ms, isoformat_z, utc_now
 from .validation import assert_identity, assert_ownership, require_non_blank_string, require_object
 
+EVENT_TYPE_ACTION_PROPOSED = "action.proposed"
+EVENT_TYPE_ACTION_STATUS_CHANGED = "action.status_changed"
+EVENT_PUBLISH_FAILURES_KEY = "eventPublishFailures"
 SAFE_CONFLICT_DETAIL_KEYS = frozenset(
     {
         "connectorCode",
@@ -42,6 +45,7 @@ class ActionService:
         token_service: Any | None = None,
         clock: Callable[[], Any] = utc_now,
         id_generator: Callable[[str], str] | None = None,
+        event_id_generator: Callable[[], str] | None = None,
     ) -> None:
         if not action_store or not connector or not event_publisher or not consent_service or not payload_vault:
             raise TypeError("action_store, connector, event_publisher, consent_service, and payload_vault are required")
@@ -53,6 +57,8 @@ class ActionService:
         self.token_service = token_service
         self.clock = clock
         self.id_generator = id_generator or (lambda prefix: f"{prefix}_{uuid4().hex}")
+        self.event_id_generator = event_id_generator or (lambda: f"evt_{uuid4().hex}")
+        self._event_sequence = 0
 
     async def create_proposed_action(self, identity: dict, input_data: dict) -> dict:
         assert_identity(identity)
@@ -89,21 +95,8 @@ class ActionService:
         if self.action_store.get(action_id):
             raise conflict_error("ACTION_ID_COLLISION", "Generated action ID already exists", {"actionId": action_id})
         created = self.action_store.create(action)
-        await maybe_await(
-            self.event_publisher.publish(
-                {
-                    "type": "action.proposed",
-                    "actionId": created["actionId"],
-                    "sessionId": created["sessionId"],
-                    "actionType": created["actionType"],
-                    "resourceRef": {"provider": created["provider"], "resourceId": created["resourceId"]},
-                    "summary": created["summary"],
-                    "expiresAt": created["expiresAt"],
-                    **request_event_context(input_data),
-                }
-            )
-        )
-        return created
+        publish_failure = await self._publish_action_proposed(created, request_event_context(input_data))
+        return with_event_publish_failure(created, publish_failure)
 
     async def approve_action(self, identity: dict, input_data: dict) -> dict:
         input_data = require_object(input_data, "input")
@@ -129,8 +122,8 @@ class ActionService:
             patch={"status": ACTION_STATUS.APPROVED.value, "approvedAt": now, "updatedAt": now},
         )
         updated = require_transition_updated(result, "ACTION_NOT_APPROVABLE", "Action cannot be approved from its current status")
-        await self._publish_status(updated, action["status"], updated["status"], "USER_APPROVED", event_context)
-        return updated
+        publish_failure = await self._publish_status(updated, action["status"], updated["status"], "USER_APPROVED", event_context)
+        return with_event_publish_failure(updated, publish_failure)
 
     async def reject_action(self, identity: dict, input_data: dict) -> dict:
         input_data = require_object(input_data, "input")
@@ -165,8 +158,8 @@ class ActionService:
         if result["kind"] == "STATUS_MISMATCH" and is_terminal_or_raise(result["action"]):
             return result["action"]
         updated = require_transition_updated(result, "ACTION_NOT_REJECTABLE", "Action cannot be rejected from its current status")
-        await self._publish_status(updated, action["status"], updated["status"], reason_code, event_context)
-        return updated
+        publish_failure = await self._publish_status(updated, action["status"], updated["status"], reason_code, event_context)
+        return with_event_publish_failure(updated, publish_failure)
 
     async def apply_action(self, identity: dict, input_data: dict) -> dict:
         input_data = require_object(input_data, "input")
@@ -220,8 +213,12 @@ class ActionService:
             )
         except Exception as error:
             failed = self._complete_reserved_apply_failure(reserved_action, idempotency_key, "CONSENT_CHECK_FAILED")
-            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
-            raise dependency_error("CONSENT_CHECK_FAILED", "Consent status could not be validated", {"actionId": action["actionId"]}) from error
+            publish_failure = await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            raise dependency_error(
+                "CONSENT_CHECK_FAILED",
+                "Consent status could not be validated",
+                {"actionId": action["actionId"], **event_publish_failure_metadata(publish_failure)},
+            ) from error
         if not consent or not consent.get("allowed"):
             conflicted = self._complete_reserved_apply(
                 reserved_action,
@@ -233,15 +230,19 @@ class ActionService:
                     "reasonCode": (consent or {}).get("reasonCode", "CONSENT_REQUIRED"),
                 },
             )
-            await self._publish_status(conflicted, action["status"], conflicted["status"], conflicted["reasonCode"], event_context)
-            return terminal_result(conflicted)
+            publish_failure = await self._publish_status(conflicted, action["status"], conflicted["status"], conflicted["reasonCode"], event_context)
+            return terminal_result(conflicted, publish_failure)
 
         try:
             token_status = await self._validate_token_status(reserved_action)
         except Exception as error:
             failed = self._complete_reserved_apply_failure(reserved_action, idempotency_key, "TOKEN_STATUS_CHECK_FAILED")
-            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
-            raise dependency_error("TOKEN_STATUS_CHECK_FAILED", "Token status could not be validated", {"actionId": action["actionId"]}) from error
+            publish_failure = await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            raise dependency_error(
+                "TOKEN_STATUS_CHECK_FAILED",
+                "Token status could not be validated",
+                {"actionId": action["actionId"], **event_publish_failure_metadata(publish_failure)},
+            ) from error
         if not token_status.get("valid"):
             failed = self._complete_reserved_apply(
                 reserved_action,
@@ -253,15 +254,19 @@ class ActionService:
                     "failureCode": token_status.get("reasonCode", "RECONNECT_REQUIRED"),
                 },
             )
-            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
-            return terminal_result(failed)
+            publish_failure = await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            return terminal_result(failed, publish_failure)
 
         try:
             validation = await maybe_await(self.connector.validate_target(reserved_action))
         except Exception as error:
             failed = self._complete_reserved_apply_failure(reserved_action, idempotency_key, "TARGET_VALIDATION_FAILED")
-            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
-            raise dependency_error("TARGET_VALIDATION_FAILED", "Mutation target could not be validated", {"actionId": action["actionId"]}) from error
+            publish_failure = await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            raise dependency_error(
+                "TARGET_VALIDATION_FAILED",
+                "Mutation target could not be validated",
+                {"actionId": action["actionId"], **event_publish_failure_metadata(publish_failure)},
+            ) from error
         if not validation or not validation.get("valid"):
             conflicted = self._complete_reserved_apply(
                 reserved_action,
@@ -273,8 +278,8 @@ class ActionService:
                     "reasonCode": (validation or {}).get("reasonCode", "TARGET_CONFLICT"),
                 },
             )
-            await self._publish_status(conflicted, action["status"], conflicted["status"], conflicted["reasonCode"], event_context)
-            return terminal_result(conflicted)
+            publish_failure = await self._publish_status(conflicted, action["status"], conflicted["status"], conflicted["reasonCode"], event_context)
+            return terminal_result(conflicted, publish_failure)
 
         try:
             payload = await maybe_await(self.payload_vault.decrypt(reserved_action["encryptedPayload"]))
@@ -289,8 +294,12 @@ class ActionService:
                     "failureCode": "ACTION_PAYLOAD_DECRYPT_FAILED",
                 },
             )
-            await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
-            raise dependency_error("ACTION_PAYLOAD_DECRYPT_FAILED", "Action payload could not be decrypted", {"actionId": action["actionId"]}) from error
+            publish_failure = await self._publish_status(failed, action["status"], failed["status"], failed["reasonCode"], event_context)
+            raise dependency_error(
+                "ACTION_PAYLOAD_DECRYPT_FAILED",
+                "Action payload could not be decrypted",
+                {"actionId": action["actionId"], **event_publish_failure_metadata(publish_failure)},
+            ) from error
         try:
             apply_result = await maybe_await(
                 self.connector.apply_action(
@@ -314,8 +323,12 @@ class ActionService:
                     "updatedAt": isoformat_z(self.clock()),
                 },
             )
-            await self._publish_status(failed, action["status"], failed["status"], "PROVIDER_WRITE_FAILED", event_context)
-            raise dependency_error("PROVIDER_WRITE_FAILED", "Provider write failed", {"actionId": action["actionId"]}) from error
+            publish_failure = await self._publish_status(failed, action["status"], failed["status"], "PROVIDER_WRITE_FAILED", event_context)
+            raise dependency_error(
+                "PROVIDER_WRITE_FAILED",
+                "Provider write failed",
+                {"actionId": action["actionId"], **event_publish_failure_metadata(publish_failure)},
+            ) from error
 
         applied = self.action_store.complete_apply(
             action["actionId"],
@@ -334,8 +347,8 @@ class ActionService:
                 "updatedAt": isoformat_z(self.clock()),
             },
         )
-        await self._publish_status(applied, action["status"], applied["status"], "APPLY_SUCCEEDED", event_context)
-        return applied["applyResult"]
+        publish_failure = await self._publish_status(applied, action["status"], applied["status"], "APPLY_SUCCEEDED", event_context)
+        return terminal_result(applied, publish_failure)
 
     def _complete_reserved_apply_failure(self, action: dict, idempotency_key: str, reason_code: str) -> dict:
         return self._complete_reserved_apply(
@@ -461,6 +474,21 @@ class ActionService:
             )
         raise validation_error("ACTION_NOT_FOUND", "Action was not found", {"actionId": action["actionId"]})
 
+    async def _publish_action_proposed(self, action: dict, event_context: dict | None = None) -> dict | None:
+        return await self._publish_event(
+            action,
+            {
+                "type": EVENT_TYPE_ACTION_PROPOSED,
+                "actionId": action["actionId"],
+                "sessionId": action["sessionId"],
+                "actionType": action["actionType"],
+                "resourceRef": {"provider": action["provider"], "resourceId": action["resourceId"]},
+                "summary": action["summary"],
+                "expiresAt": action["expiresAt"],
+                **(event_context or {}),
+            },
+        )
+
     async def _publish_status(
         self,
         action: dict,
@@ -468,20 +496,44 @@ class ActionService:
         status: str,
         reason_code: str,
         event_context: dict | None = None,
-    ) -> None:
-        await maybe_await(
-            self.event_publisher.publish(
-                {
-                    "type": "action.status_changed",
-                    "actionId": action["actionId"],
-                    "sessionId": action["sessionId"],
-                    "previousStatus": previous_status,
-                    "status": status,
-                    "reasonCode": reason_code,
-                    **(event_context or {}),
-                }
-            )
+    ) -> dict | None:
+        return await self._publish_event(
+            action,
+            {
+                "type": EVENT_TYPE_ACTION_STATUS_CHANGED,
+                "actionId": action["actionId"],
+                "sessionId": action["sessionId"],
+                "previousStatus": previous_status,
+                "status": status,
+                "reasonCode": reason_code,
+                **(event_context or {}),
+            },
         )
+
+    async def _publish_event(self, action: dict, event: dict) -> dict | None:
+        try:
+            await maybe_await(self.event_publisher.publish(self._session_event(action, event)))
+            return None
+        except OrchestrationError as error:
+            return event_publish_failure(event, error.code, error.category)
+        except Exception:
+            return event_publish_failure(event, "EVENT_PUBLISH_FAILED", "DEPENDENCY")
+
+    def _session_event(self, action: dict, event: dict) -> dict:
+        self._event_sequence += 1
+        payload = event_payload(event)
+        return {
+            **event,
+            "eventId": self.event_id_generator(),
+            "tenantId": action["tenantId"],
+            "userId": action["userId"],
+            "sessionId": action["sessionId"],
+            "requestId": event.get("requestId"),
+            "correlationId": event.get("correlationId"),
+            "sequence": self._event_sequence,
+            "createdAt": isoformat_z(self.clock()),
+            "payload": payload,
+        }
 
 
 def create_action_service(**kwargs: Any) -> ActionService:
@@ -529,16 +581,17 @@ def is_valid_target_range(value: Any) -> bool:
     return isinstance(start, int) and isinstance(end, int) and start >= 0 and end > start
 
 
-def terminal_result(action: dict) -> dict:
+def terminal_result(action: dict, publish_failure: dict | None = None) -> dict:
     if action.get("applyResult"):
-        return action["applyResult"]
-    return {
+        return with_event_publish_failure(action["applyResult"], publish_failure)
+    result = {
         "status": action["status"],
         "actionId": action["actionId"],
         "reasonCode": action.get("reasonCode"),
         "conflictDetails": action.get("conflictDetails"),
         "providerOperationId": action.get("providerOperationId"),
     }
+    return with_event_publish_failure(result, publish_failure)
 
 
 def resolve_action_ttl_ms(ttl_ms: Any) -> int:
@@ -580,3 +633,29 @@ def to_safe_conflict_details(details: dict) -> dict:
 
 def is_safe_metadata_value(value: Any) -> bool:
     return value is None or isinstance(value, (str, int, float, bool))
+
+
+def event_payload(event: dict) -> dict:
+    excluded = {"type", "tenantId", "userId", "sessionId", "requestId", "correlationId", "eventId", "sequence", "createdAt", "payload"}
+    return {key: value for key, value in event.items() if key not in excluded}
+
+
+def event_publish_failure(event: dict, code: str, category: str) -> dict:
+    return {
+        "code": code,
+        "category": category,
+        "eventType": event.get("type"),
+        "dependencyStatus": "publish_failed",
+    }
+
+
+def with_event_publish_failure(result: dict, publish_failure: dict | None) -> dict:
+    if not publish_failure:
+        return result
+    failures = list(result.get(EVENT_PUBLISH_FAILURES_KEY, []))
+    failures.append(publish_failure)
+    return {**result, EVENT_PUBLISH_FAILURES_KEY: failures}
+
+
+def event_publish_failure_metadata(publish_failure: dict | None) -> dict:
+    return {EVENT_PUBLISH_FAILURES_KEY: [publish_failure]} if publish_failure else {}
