@@ -53,6 +53,12 @@ Relevant LLDs:
 - [x] M9-T6: Verify proposed-action creation, approve/reject, apply, idempotent replay, stale conflict, safe provider failure, and status events preserve M6/M7 lifecycle guarantees.
 - [x] M9-T6: Categorize action event publisher outages as metadata-only dependency failures without corrupting durable proposed-action state or requiring an open SSE connection to complete mutations.
 
+## Completed M10 Local Tasks
+
+- [x] M10-T4: Expose package-level dogfood `GET /providers` routing through an injected provider-status dependency with no-store responses and safe payload filtering.
+- [x] M10-T4: Allow package-level dogfood command creation to use injected command/action/provider-status dependencies instead of an unconditional missing-dependency runtime, while preserving structured missing-dependency fallbacks when backing services are absent.
+- [x] M10-T6: Wire package-level dogfood runtime action routes for proposed-action create/list/get, approve, reject, and apply to durable runtime action state, with deterministic tests for metadata-only responses, scoped authorization, and idempotent apply replay after safe connector dependency failure.
+
 ## Architecture Tasks Pending
 
 - Approved direction: migrate from the temporary Node.js ESM bootstrap to Python initially. Revisit Java only if long-running workflow throughput or typed domain needs justify it.

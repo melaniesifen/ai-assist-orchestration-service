@@ -5,7 +5,7 @@ import unittest
 
 from ai_assist_orchestration import OrchestrationHttpRuntime, create_http_command_boundary
 
-from common import RecordingActionService, RecordingCommandService
+from common import RecordingActionService, RecordingCommandService, RecordingProviderStatusService
 
 
 AUTH_HEADERS = {
@@ -39,6 +39,32 @@ class HttpRuntimeTests(unittest.TestCase):
         self.assertEqual(command_service.identity, {"tenantId": "tenant_001", "userId": "user_001"})
         self.assertEqual(command_service.command["sessionId"], "session_001")
         self.assertEqual(command_service.command["idempotencyKey"], "idem_001")
+
+    def test_provider_status_route_maps_trusted_auth_headers(self) -> None:
+        provider_status = RecordingProviderStatusService({"providers": [{"provider": "openai", "available": True}]})
+        runtime = OrchestrationHttpRuntime(
+            boundary=create_http_command_boundary(
+                command_service=RecordingCommandService({}),
+                action_service=RecordingActionService(),
+                request_id_generator=lambda: "req_generated",
+                correlation_id_generator=lambda: "corr_generated",
+            ),
+            provider_status_service=provider_status,
+        )
+
+        response = runtime.handle_request(
+            {
+                "method": "GET",
+                "path": "/providers",
+                "headers": AUTH_HEADERS,
+                "body": "",
+            }
+        )
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(provider_status.identity, {"tenantId": "tenant_001", "userId": "user_001"})
+        self.assertEqual(provider_status.request["requestId"], "req_generated")
+        self.assertEqual(response["body"]["data"]["providers"][0]["provider"], "openai")
 
     def test_action_route_maps_action_id_from_path_and_rejects_spoofed_body_identity(self) -> None:
         action_service = RecordingActionService()

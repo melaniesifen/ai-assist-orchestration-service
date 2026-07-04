@@ -270,6 +270,18 @@ class RecordingCommandService:
         return self.result
 
 
+class RecordingProviderStatusService:
+    def __init__(self, result):
+        self.result = result
+        self.identity = None
+        self.request = None
+
+    async def list_provider_status(self, identity, request):
+        self.identity = identity
+        self.request = request
+        return self.result
+
+
 class RecordingActionService:
     def __init__(self):
         self.identity = None

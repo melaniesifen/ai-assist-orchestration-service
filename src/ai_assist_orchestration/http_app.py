@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
+from .action_service import create_action_service
 from .errors import OrchestrationError
 from .http_adapter import create_http_command_boundary
 from .http_runtime import JSON_CONTENT_TYPE, OrchestrationHttpRuntime
+from .runtime_dependencies import (
+    AllowingConsentService,
+    JsonFileActionStore,
+    NoopEventPublisher,
+    UnconfiguredConnector,
+    UnconfiguredPayloadVault,
+)
 
 NO_STORE_HEADERS = {
     "Cache-Control": "no-store",
@@ -44,13 +53,44 @@ def configure_http_runtime(runtime: OrchestrationHttpRuntime | None) -> None:
     _runtime = runtime
 
 
+def configure_http_dependencies(
+    *,
+    command_service: Any | None = None,
+    action_service: Any | None = None,
+    provider_status_service: Any | None = None,
+) -> None:
+    """Configure package-level dogfood dependencies without replacing the runtime."""
+    missing_dependencies = MissingDependencyService()
+    runtime_action_service = action_service or create_default_action_service()
+    configure_http_runtime(
+        OrchestrationHttpRuntime(
+            boundary=create_http_command_boundary(
+                command_service=command_service or missing_dependencies,
+                action_service=runtime_action_service,
+            ),
+            provider_status_service=provider_status_service or missing_dependencies,
+        )
+    )
+
+
 def create_default_http_runtime() -> OrchestrationHttpRuntime:
     missing_dependencies = MissingDependencyService()
     return OrchestrationHttpRuntime(
         boundary=create_http_command_boundary(
             command_service=missing_dependencies,
-            action_service=missing_dependencies,
-        )
+            action_service=create_default_action_service(),
+        ),
+        provider_status_service=missing_dependencies,
+    )
+
+
+def create_default_action_service() -> Any:
+    return create_action_service(
+        action_store=JsonFileActionStore(os.environ.get("ORCHESTRATION_ACTION_STORE_PATH", "/tmp/ai-assist-orchestration/actions.json")),
+        connector=UnconfiguredConnector(),
+        event_publisher=NoopEventPublisher(),
+        consent_service=AllowingConsentService(),
+        payload_vault=UnconfiguredPayloadVault(),
     )
 
 
@@ -73,8 +113,20 @@ def with_no_store(response: dict[str, Any]) -> dict[str, Any]:
 
 
 class MissingDependencyService:
+    async def list_provider_status(self, _identity: dict, request: dict) -> dict:
+        raise deployed_dependencies_missing("provider_status", request)
+
     async def run_assistant_command(self, _identity: dict, command: dict) -> dict:
         raise deployed_dependencies_missing("create_command", command)
+
+    async def create_proposed_action(self, _identity: dict, input_data: dict) -> dict:
+        raise deployed_dependencies_missing("create_action", input_data)
+
+    async def list_actions(self, _identity: dict, input_data: dict) -> dict:
+        raise deployed_dependencies_missing("list_actions", input_data)
+
+    async def get_action(self, _identity: dict, input_data: dict) -> dict:
+        raise deployed_dependencies_missing("get_action", input_data)
 
     async def approve_action(self, _identity: dict, input_data: dict) -> dict:
         raise deployed_dependencies_missing("approve_action", input_data)

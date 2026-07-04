@@ -23,6 +23,17 @@ class InMemoryActionStore:
             action = self._actions.get(action_id)
             return deepcopy(action) if action is not None else None
 
+    def list_for_session(self, *, tenant_id: str, user_id: str, session_id: str) -> list[dict]:
+        with self._lock:
+            actions = [
+                deepcopy(action)
+                for action in self._actions.values()
+                if action.get("tenantId") == tenant_id
+                and action.get("userId") == user_id
+                and action.get("sessionId") == session_id
+            ]
+        return sorted(actions, key=lambda action: (action.get("createdAt", ""), action.get("actionId", "")))
+
     def update(self, action_id: str, updater: Callable[[dict], dict]) -> dict | None:
         with self._lock:
             current = self.get(action_id)

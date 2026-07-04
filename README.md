@@ -23,7 +23,9 @@ This service does not own:
 
 The package is dependency-light Python and exports pure domain services with injected collaborators. Runtime code uses only the Python standard library. The included in-memory action repository is for local tests and future adapter development only.
 
-`src/ai_assist_orchestration/http_adapter.py` provides a framework-neutral command/action boundary. `src/ai_assist_orchestration/http_runtime.py` wraps that boundary in a stdlib HTTP runtime for the canonical command, approve, reject, and apply-action route shapes. The runtime requires a server-derived auth context, defaulting to trusted upstream headers `X-AI-Assist-Tenant-Id` and `X-AI-Assist-User-Id`, and rejects path/body session or action mismatches before invoking domain services.
+`src/ai_assist_orchestration/http_adapter.py` provides a framework-neutral command/action boundary. `src/ai_assist_orchestration/http_runtime.py` wraps that boundary in a stdlib HTTP runtime for the canonical command, proposed-action create/list/get, approve, reject, and apply-action route shapes. The runtime requires a server-derived auth context, defaulting to trusted upstream headers `X-AI-Assist-Tenant-Id` and `X-AI-Assist-User-Id`, and rejects path/body session or action mismatches before invoking domain services.
+
+The package-level dogfood handler wires proposed-action routes to the real action lifecycle service with a dependency-light JSON file action store. Override the default action file with `ORCHESTRATION_ACTION_STORE_PATH`. The default payload vault and connector dependencies fail safely until encrypted payload storage and a Google Docs apply adapter are injected, so standalone package routes cannot persist decrypted proposal text by accident.
 
 Production provider, context, connector, event, persistence, and encryption adapters should implement the injected dependency contracts without logging raw prompts, document text, model responses, secrets, or decrypted action payloads. Durable AWS storage and real cross-service clients are still supplied outside this package.
 

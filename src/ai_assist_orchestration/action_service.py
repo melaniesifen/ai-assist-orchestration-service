@@ -98,6 +98,25 @@ class ActionService:
         publish_failure = await self._publish_action_proposed(created, request_event_context(input_data))
         return with_event_publish_failure(created, publish_failure)
 
+    async def list_actions(self, identity: dict, input_data: dict) -> dict:
+        identity = assert_identity(identity)
+        input_data = require_object(input_data, "input")
+        session_id = require_non_blank_string(input_data.get("sessionId"), "input.sessionId")
+        actions = self.action_store.list_for_session(
+            tenant_id=identity["tenantId"],
+            user_id=identity["userId"],
+            session_id=session_id,
+        )
+        return {"actions": [public_action_view(action) for action in actions]}
+
+    async def get_action(self, identity: dict, input_data: dict) -> dict:
+        input_data = require_object(input_data, "input")
+        action = self._get_authorized_action(identity, input_data, require_resource_id=False)
+        if isinstance(input_data.get("resourceId"), str) and input_data["resourceId"].strip() and action.get("resourceId") != input_data["resourceId"]:
+            raise authorization_error("ACTION_FORBIDDEN", "Action is not accessible for this resource", {"actionId": action["actionId"]})
+        require_action_status(action)
+        return public_action_view(action)
+
     async def approve_action(self, identity: dict, input_data: dict) -> dict:
         input_data = require_object(input_data, "input")
         event_context = request_event_context(input_data)
@@ -408,7 +427,7 @@ class ActionService:
             {"actionId": action["actionId"], "status": (current or action).get("status")},
         )
 
-    def _get_authorized_action(self, identity: dict, input_data: dict) -> dict:
+    def _get_authorized_action(self, identity: dict, input_data: dict, *, require_resource_id: bool = True) -> dict:
         assert_identity(identity)
         action_id = require_non_blank_string(input_data.get("actionId"), "actionId")
         action = self.action_store.get(action_id)
@@ -417,11 +436,12 @@ class ActionService:
         if not assert_ownership(identity, action):
             raise authorization_error("ACTION_FORBIDDEN", "Action is not accessible to this identity", {"actionId": action_id})
         expected_session_id = require_non_blank_string(input_data.get("sessionId"), "input.sessionId")
-        expected_resource_id = require_non_blank_string(input_data.get("resourceId"), "input.resourceId")
         if action.get("sessionId") != expected_session_id:
             raise authorization_error("ACTION_FORBIDDEN", "Action is not accessible for this session", {"actionId": action_id})
-        if action.get("resourceId") != expected_resource_id:
-            raise authorization_error("ACTION_FORBIDDEN", "Action is not accessible for this resource", {"actionId": action_id})
+        if require_resource_id:
+            expected_resource_id = require_non_blank_string(input_data.get("resourceId"), "input.resourceId")
+            if action.get("resourceId") != expected_resource_id:
+                raise authorization_error("ACTION_FORBIDDEN", "Action is not accessible for this resource", {"actionId": action_id})
         return action
 
     async def _expire_action_if_needed(
@@ -592,6 +612,11 @@ def terminal_result(action: dict, publish_failure: dict | None = None) -> dict:
         "providerOperationId": action.get("providerOperationId"),
     }
     return with_event_publish_failure(result, publish_failure)
+
+
+def public_action_view(action: dict) -> dict:
+    hidden_fields = {"encryptedPayload", "applyLock"}
+    return {key: value for key, value in action.items() if key not in hidden_fields}
 
 
 def resolve_action_ttl_ms(ttl_ms: Any) -> int:

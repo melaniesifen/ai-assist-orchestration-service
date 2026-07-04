@@ -4,21 +4,55 @@ import asyncio
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections.abc import Mapping
 from typing import Any, Callable
 
+from .async_utils import maybe_await
 from .errors import OrchestrationError, validation_error
-from .http_adapter import HttpCommandBoundary, normalize_headers
+from .http_adapter import HttpCommandBoundary, error_response, normalize_headers, success_response
 from .validation import require_non_blank_string
 
 HEADER_TENANT_ID = "x-ai-assist-tenant-id"
 HEADER_USER_ID = "x-ai-assist-user-id"
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 MAX_BODY_BYTES = 256 * 1024
+ERROR_CODE_PROVIDER_STATUS_DEPENDENCY_UNAVAILABLE = "PROVIDER_STATUS_DEPENDENCY_UNAVAILABLE"
 
+PROVIDERS_ROUTE = re.compile(r"^/providers$")
 COMMAND_ROUTE = re.compile(r"^/resource-sessions/(?P<session_id>[^/]+)/commands$")
+ACTION_COLLECTION_ROUTE = re.compile(r"^/resource-sessions/(?P<session_id>[^/]+)/actions$")
+ACTION_ITEM_ROUTE = re.compile(r"^/resource-sessions/(?P<session_id>[^/]+)/actions/(?P<action_id>[^/]+)$")
 APPROVE_ROUTE = re.compile(r"^/resource-sessions/(?P<session_id>[^/]+)/actions/(?P<action_id>[^/]+)/approve$")
 REJECT_ROUTE = re.compile(r"^/resource-sessions/(?P<session_id>[^/]+)/actions/(?P<action_id>[^/]+)/reject$")
 APPLY_ROUTE = re.compile(r"^/resource-sessions/(?P<session_id>[^/]+)/apply-action$")
+
+SENSITIVE_PROVIDER_STATUS_KEYS = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "authorization",
+        "bearertoken",
+        "content",
+        "context",
+        "credential",
+        "credentials",
+        "documenttext",
+        "modelresponse",
+        "messages",
+        "model",
+        "input",
+        "output",
+        "prompt",
+        "rawprompt",
+        "rawresponse",
+        "response",
+        "refreshtoken",
+        "secretarn",
+        "secretref",
+        "secretreference",
+        "secretvalue",
+    }
+)
 
 
 class OrchestrationHttpRuntime:
@@ -28,6 +62,7 @@ class OrchestrationHttpRuntime:
         self,
         *,
         boundary: HttpCommandBoundary,
+        provider_status_service: Any | None = None,
         resolve_auth: Callable[[dict[str, Any]], dict[str, str]] | None = None,
         max_body_bytes: int = MAX_BODY_BYTES,
     ) -> None:
@@ -36,6 +71,7 @@ class OrchestrationHttpRuntime:
         if not isinstance(max_body_bytes, int) or max_body_bytes < 1:
             raise TypeError("max_body_bytes must be a positive integer")
         self.boundary = boundary
+        self.provider_status_service = provider_status_service
         self.resolve_auth = resolve_auth or trusted_header_identity
         self.max_body_bytes = max_body_bytes
 
@@ -65,10 +101,36 @@ class OrchestrationHttpRuntime:
         auth = self.resolve_auth({"method": method, "path": path, "headers": headers})
         body = parse_json_body(request.get("body", b""), max_body_bytes=self.max_body_bytes)
 
+        if method == "GET" and PROVIDERS_ROUTE.match(path):
+            return {
+                "operation": self._provider_status,
+                "boundaryRequest": {"auth": auth, "headers": headers, "body": body},
+            }
         if method == "POST" and (match := COMMAND_ROUTE.match(path)):
             return {
                 "operation": self.boundary.create_command,
                 "boundaryRequest": boundary_request(auth, headers, body, session_id=match.group("session_id")),
+            }
+        if method == "POST" and (match := ACTION_COLLECTION_ROUTE.match(path)):
+            return {
+                "operation": self.boundary.create_action,
+                "boundaryRequest": boundary_request(auth, headers, body, session_id=match.group("session_id")),
+            }
+        if method == "GET" and (match := ACTION_COLLECTION_ROUTE.match(path)):
+            return {
+                "operation": self.boundary.list_actions,
+                "boundaryRequest": boundary_request(auth, headers, body, session_id=match.group("session_id")),
+            }
+        if method == "GET" and (match := ACTION_ITEM_ROUTE.match(path)):
+            return {
+                "operation": self.boundary.get_action,
+                "boundaryRequest": boundary_request(
+                    auth,
+                    headers,
+                    body,
+                    session_id=match.group("session_id"),
+                    action_id=match.group("action_id"),
+                ),
             }
         if method == "POST" and (match := APPROVE_ROUTE.match(path)):
             return {
@@ -104,6 +166,31 @@ class OrchestrationHttpRuntime:
             status_code=404,
             metadata={"route": path},
         )
+
+    async def _provider_status(self, request: dict[str, Any]) -> dict[str, Any]:
+        context = None
+        try:
+            context = self.boundary.request_context(request)
+            if self.provider_status_service is None:
+                raise OrchestrationError(
+                    code=ERROR_CODE_PROVIDER_STATUS_DEPENDENCY_UNAVAILABLE,
+                    category="DEPENDENCY",
+                    message="Provider status dependency is not configured",
+                    status_code=501,
+                    metadata={"operation": "provider_status"},
+                )
+            result = await maybe_await(
+                self.provider_status_service.list_provider_status(
+                    context.identity,
+                    {
+                        "requestId": context.request_id,
+                        "correlationId": context.correlation_id,
+                    },
+                )
+            )
+            return success_response(200, safe_provider_status_payload(result), context)
+        except OrchestrationError as error:
+            return error_response(error, context or self.boundary._error_context(request))
 
 
 def trusted_header_identity(request: dict[str, Any]) -> dict[str, str]:
@@ -177,6 +264,35 @@ def parse_json_body(body: Any, *, max_body_bytes: int) -> dict[str, Any]:
     return parsed
 
 
+def safe_provider_status_payload(result: Any) -> dict[str, Any]:
+    if isinstance(result, Mapping):
+        return _safe_status_value(dict(result))
+    if isinstance(result, list):
+        return {"providers": _safe_status_value(result)}
+    raise OrchestrationError(
+        code="PROVIDER_STATUS_DEPENDENCY_MALFORMED",
+        category="DEPENDENCY",
+        message="Provider status dependency returned a malformed response",
+        status_code=502,
+        metadata={"operation": "provider_status", "dependencyStatus": "malformed"},
+    )
+
+
+def _safe_status_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        safe = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            if key.strip().lower().replace("_", "").replace("-", "") in SENSITIVE_PROVIDER_STATUS_KEYS:
+                continue
+            safe[key] = _safe_status_value(item)
+        return safe
+    if isinstance(value, list):
+        return [_safe_status_value(item) for item in value]
+    return value
+
+
 def runtime_error_response(error: OrchestrationError) -> dict[str, Any]:
     return {
         "statusCode": error.status_code,
@@ -212,17 +328,15 @@ def create_http_handler(runtime: OrchestrationHttpRuntime) -> type[BaseHTTPReque
             write_json_response(self, response)
 
         def do_GET(self) -> None:  # noqa: N802
-            write_json_response(
-                self,
-                runtime_error_response(
-                    OrchestrationError(
-                        code="ROUTE_NOT_FOUND",
-                        category="VALIDATION",
-                        message="Route is not handled by orchestration",
-                        status_code=404,
-                    )
-                ),
+            response = runtime.handle_request(
+                {
+                    "method": self.command,
+                    "path": self.path.split("?", 1)[0],
+                    "headers": dict(self.headers.items()),
+                    "body": b"",
+                }
             )
+            write_json_response(self, response)
 
         def log_message(self, _format: str, *_args: Any) -> None:
             return

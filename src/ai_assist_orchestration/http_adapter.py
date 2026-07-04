@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 from uuid import uuid4
 
+from .action_service import public_action_view
 from .errors import OrchestrationError
 from .validation import assert_identity, require_non_blank_string, require_object
 
@@ -32,7 +33,7 @@ class HttpCommandBoundary:
     async def create_command(self, request: dict) -> dict:
         context = None
         try:
-            context = self._request_context(request)
+            context = self.request_context(request)
             body = require_object(request.get("body"), "body")
             idempotency_key = require_idempotency_key(context.headers)
             command = without_client_identity(
@@ -63,6 +64,59 @@ class HttpCommandBoundary:
             ),
         )
 
+    async def create_action(self, request: dict) -> dict:
+        context = None
+        try:
+            context = self.request_context(request)
+            body = without_client_identity(require_object(request.get("body"), "body"))
+            result = await self.action_service.create_proposed_action(
+                context.identity,
+                {
+                    **body,
+                    "requestId": context.request_id,
+                    "correlationId": context.correlation_id,
+                },
+            )
+            return success_response(201, public_action_view(result), context)
+        except OrchestrationError as error:
+            return error_response(error, context or self._error_context(request))
+
+    async def list_actions(self, request: dict) -> dict:
+        context = None
+        try:
+            context = self.request_context(request)
+            body = without_client_identity(require_object(request.get("body"), "body"))
+            result = await self.action_service.list_actions(
+                context.identity,
+                {
+                    "sessionId": body.get("sessionId"),
+                    "requestId": context.request_id,
+                    "correlationId": context.correlation_id,
+                },
+            )
+            return success_response(200, result, context)
+        except OrchestrationError as error:
+            return error_response(error, context or self._error_context(request))
+
+    async def get_action(self, request: dict) -> dict:
+        context = None
+        try:
+            context = self.request_context(request)
+            body = without_client_identity(require_object(request.get("body"), "body"))
+            result = await self.action_service.get_action(
+                context.identity,
+                {
+                    "actionId": body.get("actionId"),
+                    "sessionId": body.get("sessionId"),
+                    "resourceId": body.get("resourceId"),
+                    "requestId": context.request_id,
+                    "correlationId": context.correlation_id,
+                },
+            )
+            return success_response(200, result, context)
+        except OrchestrationError as error:
+            return error_response(error, context or self._error_context(request))
+
     async def reject_action(self, request: dict) -> dict:
         return await self._action_response(
             request,
@@ -82,7 +136,7 @@ class HttpCommandBoundary:
     async def apply_action(self, request: dict) -> dict:
         context = None
         try:
-            context = self._request_context(request)
+            context = self.request_context(request)
             body = require_object(request.get("body"), "body")
             result = await self.action_service.apply_action(
                 context.identity,
@@ -99,13 +153,16 @@ class HttpCommandBoundary:
         except OrchestrationError as error:
             return error_response(error, context or self._error_context(request))
 
+    def request_context(self, request: dict) -> "HttpRequestContext":
+        return self._request_context(request)
+
     async def _action_response(self, request: dict, *, operation: Callable[[dict, dict, HttpRequestContext], Any]) -> dict:
         context = None
         try:
-            context = self._request_context(request)
+            context = self.request_context(request)
             body = require_object(request.get("body"), "body")
             result = await operation(context.identity, without_client_identity(body), context)
-            return success_response(200, result, context)
+            return success_response(200, public_action_view(result), context)
         except OrchestrationError as error:
             return error_response(error, context or self._error_context(request))
 
