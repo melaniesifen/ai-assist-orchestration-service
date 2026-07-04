@@ -59,6 +59,17 @@ Relevant LLDs:
 - [x] M10-T4: Allow package-level dogfood command creation to use injected command/action/provider-status dependencies instead of an unconditional missing-dependency runtime, while preserving structured missing-dependency fallbacks when backing services are absent.
 - [x] M10-T6: Wire package-level dogfood runtime action routes for proposed-action create/list/get, approve, reject, and apply to durable runtime action state, with deterministic tests for metadata-only responses, scoped authorization, and idempotent apply replay after safe connector dependency failure.
 
+## Milestone 11 Real User Isolation
+
+- [ ] M11-T4: Before provider generation, require platform-metered provider
+  access to return a per-user quota/audit decision for the derived `tenantId`
+  and `userId`; fail closed when multi-user quota/audit readiness is missing.
+- [ ] M11-T4: Preserve optional BYO provider secret handoff only when explicitly
+  enabled and scoped to the derived tenant/user/provider.
+- [ ] M11-T5: Add user A/user B orchestration tests proving sessions, proposed
+  actions, approve/reject/apply routes, consent grants, and provider access
+  cannot cross tenant/user boundaries.
+
 ## Architecture Tasks Pending
 
 - Approved direction: migrate from the temporary Node.js ESM bootstrap to Python initially. Revisit Java only if long-running workflow throughput or typed domain needs justify it.
