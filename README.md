@@ -23,14 +23,17 @@ This service does not own:
 
 The package is dependency-light Python and exports pure domain services with injected collaborators. Runtime code uses only the Python standard library. The included in-memory action repository is for local tests and future adapter development only.
 
-Future HTTP adapters should derive `tenantId` and `userId` from authenticated identity before calling these services. Future provider, context, connector, event, and encryption adapters should implement the injected dependency contracts without logging raw prompts, document text, model responses, secrets, or decrypted action payloads.
+`src/ai_assist_orchestration/http_adapter.py` provides a framework-neutral command/action boundary. `src/ai_assist_orchestration/http_runtime.py` wraps that boundary in a stdlib HTTP runtime for the canonical command, approve, reject, and apply-action route shapes. The runtime requires a server-derived auth context, defaulting to trusted upstream headers `X-AI-Assist-Tenant-Id` and `X-AI-Assist-User-Id`, and rejects path/body session or action mismatches before invoking domain services.
+
+Production provider, context, connector, event, persistence, and encryption adapters should implement the injected dependency contracts without logging raw prompts, document text, model responses, secrets, or decrypted action payloads. Durable AWS storage and real cross-service clients are still supplied outside this package.
 
 Proposed action IDs and expirations are server-owned. Callers may request a shorter TTL with `ttlMs`, but actions are capped at the 24-hour MVP maximum.
 
 ## Package Layout
 
 - `src/ai_assist_orchestration/`: orchestration domain package.
-- `src/ai_assist_orchestration/http_adapter.py`: framework-neutral HTTP command boundary for future route adapters.
+- `src/ai_assist_orchestration/http_adapter.py`: framework-neutral HTTP command boundary.
+- `src/ai_assist_orchestration/http_runtime.py`: dependency-free stdlib HTTP runtime for deployed service wrapping.
 - `tests/`: stdlib `unittest` coverage for command coordination and proposed-action lifecycle behavior.
 - `pyproject.toml`: Python packaging metadata with no runtime dependencies.
 

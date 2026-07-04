@@ -11,6 +11,7 @@ from .errors import (
     validation_error,
 )
 from .http_adapter import HttpCommandBoundary, create_http_command_boundary
+from .http_runtime import OrchestrationHttpRuntime, create_http_handler, serve_http, trusted_header_identity
 
 __all__ = [
     "ACTION_STATUS",
@@ -19,12 +20,16 @@ __all__ = [
     "InMemoryActionStore",
     "OrchestrationError",
     "HttpCommandBoundary",
+    "OrchestrationHttpRuntime",
     "authorization_error",
     "conflict_error",
     "create_action_service",
     "create_command_service",
     "create_http_command_boundary",
+    "create_http_handler",
     "dependency_error",
     "policy_error",
+    "serve_http",
+    "trusted_header_identity",
     "validation_error",
 ]

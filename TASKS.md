@@ -60,6 +60,8 @@ Relevant LLDs:
 - [ ] REPO-001: Decide final language, runtime, package manager, framework, package layout, migration cost, deployment target, and test strategy for this repo.
 - [ ] EVT-001: Add the HTTP command API adapter for command creation, action approval/rejection, and apply-action with server-derived identity, request IDs, correlation IDs, and idempotency keys.
   - [x] Add repo-local, framework-neutral Python HTTP boundary DTOs/adapters for command creation, action approval, action rejection, and apply-action.
+  - [x] Add a dependency-free stdlib HTTP runtime wrapper for canonical command, approve, reject, and apply-action route shapes.
+  - [x] Require trusted upstream auth context headers at the runtime boundary and reject path/body session or action mismatches before domain calls.
   - [x] Propagate request IDs and correlation IDs from the HTTP boundary into action status events.
   - [x] Require an idempotency key for command creation and apply-action at the HTTP boundary.
   - [ ] Align route names, shared request/response schemas, and contract tests with `ai-assist-contracts` once the cross-service HTTP API contracts are available.
@@ -69,7 +71,9 @@ Relevant LLDs:
   - [ ] Wire published events to the full session-events `SessionEvent` envelope once the cross-repo event bridge is available.
 - [ ] ACTION-001: Replace in-memory action storage with durable encrypted `ProposedActions` persistence scoped by tenant/user/session/resource.
 - [ ] ACTION-003: Expose authenticated HTTP approve/reject endpoints and contract tests against shared action schemas.
+  - [x] Expose stdlib runtime route wrappers for approve/reject with route-derived `sessionId` and `actionId`.
 - [ ] ACTION-004: Expose authenticated HTTP apply-action endpoint and wire real context consent, connector target verification, connector write-back, and idempotency persistence.
+  - [x] Expose stdlib runtime route wrapper for apply-action with route-derived `sessionId` and required idempotency header.
 - [ ] ACTION-006: Add explicit handling and tests for revoked Google OAuth, KMS decrypt failure, provider write uncertainty, expired action recovery, and missing consent behavior.
 - [ ] OPS-003: Add metadata-only logging around orchestration commands, provider calls, action transitions, and dependency failures.
 - [ ] OPS-004: Emit metrics for provider failures, token usage, KMS failures, action conflicts, apply failures, and dependency latency.
