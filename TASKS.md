@@ -61,10 +61,10 @@ Relevant LLDs:
 
 ## Milestone 11 Real User Isolation
 
-- [ ] M11-T4: Before provider generation, require platform-metered provider
+- [x] M11-T4: Before provider generation, require platform-metered provider
   access to return a per-user quota/audit decision for the derived `tenantId`
   and `userId`; fail closed when multi-user quota/audit readiness is missing.
-- [ ] M11-T4: Preserve optional BYO provider secret handoff only when explicitly
+- [x] M11-T4: Preserve optional BYO provider secret handoff only when explicitly
   enabled and scoped to the derived tenant/user/provider.
 - [ ] M11-T5: Add user A/user B orchestration tests proving sessions, proposed
   actions, approve/reject/apply routes, consent grants, and provider access

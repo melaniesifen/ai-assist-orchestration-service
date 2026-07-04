@@ -22,6 +22,9 @@ SUPPORTED_PROPOSAL_ACTION_TYPES = frozenset({ACTION_TYPE_INSERT_TEXT, ACTION_TYP
 
 ERROR_CODE_CONTEXT_UNAVAILABLE = "CONTEXT_UNAVAILABLE"
 ERROR_CODE_EVENT_PUBLISH_FAILED = "EVENT_PUBLISH_FAILED"
+ERROR_CODE_PROVIDER_ACCESS_AUDIT_NOT_READY = "PROVIDER_ACCESS_AUDIT_NOT_READY"
+ERROR_CODE_PROVIDER_ACCESS_QUOTA_DENIED = "PROVIDER_ACCESS_QUOTA_DENIED"
+ERROR_CODE_PROVIDER_ACCESS_QUOTA_NOT_READY = "PROVIDER_ACCESS_QUOTA_NOT_READY"
 ERROR_CODE_PROVIDER_STREAM_FAILED = "PROVIDER_STREAM_FAILED"
 PROVIDER_ACCESS_SOURCE_PLATFORM = "platform"
 PROVIDER_ACCESS_SOURCE_BYO = "byo"
@@ -142,10 +145,20 @@ class CommandService:
 
         await self._publish_progress(identity, session_id, request_id, correlation_id, "provider.generating", "in_progress")
         prompt = await maybe_await(self.prompt_builder.build_prompt({"command": command, "context": context}))
+        provider_access = scoped_provider_access_for_command(identity, command)
+        try:
+            require_provider_access_ready(
+                provider_access,
+                provider=provider_name,
+                session_id=session_id,
+            )
+        except OrchestrationError as error:
+            await self._publish_error(identity, session_id, request_id, correlation_id, error)
+            raise
         provider_request = {
             "prompt": prompt,
             "context": context,
-            "providerAccess": provider_access_for_command(command),
+            "providerAccess": provider_access,
             "requestId": request_id,
             "correlationId": correlation_id,
         }
@@ -538,16 +551,94 @@ def provider_access_for_command(command: dict) -> dict:
         return {
             "source": PROVIDER_ACCESS_SOURCE_PLATFORM,
             "reference": access.get("reference"),
+            "quotaDecision": access.get("quotaDecision"),
+            "auditDecision": access.get("auditDecision"),
         }
-    if source == PROVIDER_ACCESS_SOURCE_BYO or command.get("secretRef"):
+    if source == PROVIDER_ACCESS_SOURCE_BYO:
         return {
             "source": PROVIDER_ACCESS_SOURCE_BYO,
-            "secretRef": access.get("secretRef") or command.get("secretRef"),
+            "secretRef": access.get("secretRef"),
         }
     return {
         "source": PROVIDER_ACCESS_SOURCE_PLATFORM,
         "reference": access.get("reference"),
+        "quotaDecision": access.get("quotaDecision"),
+        "auditDecision": access.get("auditDecision"),
     }
+
+
+def scoped_provider_access_for_command(identity: dict, command: dict) -> dict:
+    access = provider_access_for_command(command)
+    if access.get("source") != PROVIDER_ACCESS_SOURCE_BYO:
+        return access
+    return {
+        **access,
+        "tenantId": identity["tenantId"],
+        "userId": identity["userId"],
+    }
+
+
+def require_provider_access_ready(access: dict, *, provider: str, session_id: str) -> None:
+    source = access.get("source")
+    if source == PROVIDER_ACCESS_SOURCE_BYO:
+        require_non_blank_string(access.get("secretRef"), "providerAccess.secretRef")
+        require_non_blank_string(access.get("tenantId"), "providerAccess.tenantId")
+        require_non_blank_string(access.get("userId"), "providerAccess.userId")
+        return
+
+    quota = access.get("quotaDecision") if isinstance(access.get("quotaDecision"), Mapping) else {}
+    audit = access.get("auditDecision") if isinstance(access.get("auditDecision"), Mapping) else {}
+    quota_decision = _normalized_decision(quota.get("decision"))
+    audit_decision = _normalized_decision(audit.get("decision"))
+    if quota_decision != "allow":
+        if quota_decision in {"deny", "blocked", "limit_exceeded"}:
+            raise OrchestrationError(
+                code=ERROR_CODE_PROVIDER_ACCESS_QUOTA_DENIED,
+                category="PROVIDER_QUOTA",
+                message="Provider quota does not allow this command",
+                retryable=False,
+                status_code=429,
+                metadata={
+                    "provider": provider,
+                    "sessionId": session_id,
+                    "reasonCode": quota.get("reasonCode") or ERROR_CODE_PROVIDER_ACCESS_QUOTA_DENIED,
+                    "dependencyStatus": quota.get("status", "quota_denied"),
+                },
+            )
+        raise OrchestrationError(
+            code=ERROR_CODE_PROVIDER_ACCESS_QUOTA_NOT_READY,
+            category="DEPENDENCY",
+            message="Provider quota readiness is not configured",
+            retryable=False,
+            status_code=503,
+            metadata={
+                "provider": provider,
+                "sessionId": session_id,
+                "reasonCode": quota.get("reasonCode") or ERROR_CODE_PROVIDER_ACCESS_QUOTA_NOT_READY,
+                "dependencyStatus": quota.get("status", "quota_not_ready"),
+            },
+        )
+    if audit_decision != "recorded":
+        raise OrchestrationError(
+            code=ERROR_CODE_PROVIDER_ACCESS_AUDIT_NOT_READY,
+            category="DEPENDENCY",
+            message="Provider audit readiness is not configured",
+            retryable=False,
+            status_code=503,
+            metadata={
+                "provider": provider,
+                "sessionId": session_id,
+                "reasonCode": audit.get("reasonCode") or ERROR_CODE_PROVIDER_ACCESS_AUDIT_NOT_READY,
+                "dependencyStatus": audit.get("status", "audit_not_ready"),
+            },
+        )
+
+
+def _normalized_decision(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
 
 
 async def _aiter(value: Any) -> Any:

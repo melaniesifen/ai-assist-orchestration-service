@@ -71,7 +71,12 @@ class CommandServiceTests(unittest.IsolatedAsyncioTestCase):
                 "provider": "openai",
                 "resourceId": "doc_001",
                 "contextMode": "SELECTION",
-                "secretRef": "secret_ref_001",
+                "providerAccess": {
+                    "source": "platform",
+                    "reference": "platform_ref_001",
+                    "quotaDecision": {"decision": "allow", "status": "ready"},
+                    "auditDecision": {"decision": "recorded", "status": "ready"},
+                },
             },
         )
 
@@ -119,7 +124,6 @@ class CommandServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         command = base_command_input()
-        command.pop("secretRef", None)
 
         result = await service.run_assistant_command(IDENTITY, command)
 
@@ -131,7 +135,15 @@ class CommandServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[4]["usage"], {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5})
         self.assertEqual(observed_provider_request["context"]["contextMode"], "SELECTION")
         self.assertTrue(observed_provider_request["context"]["provenance"]["connectorVerified"])
-        self.assertEqual(observed_provider_request["providerAccess"], {"source": "platform", "reference": None})
+        self.assertEqual(
+            observed_provider_request["providerAccess"],
+            {
+                "source": "platform",
+                "reference": "platform_ref_001",
+                "quotaDecision": {"decision": "allow", "status": "ready"},
+                "auditDecision": {"decision": "recorded", "status": "ready"},
+            },
+        )
         self.assertNotIn("secretRef", observed_provider_request)
 
     async def test_published_command_events_include_session_event_envelope_fields(self) -> None:
@@ -183,12 +195,55 @@ class CommandServiceTests(unittest.IsolatedAsyncioTestCase):
             IDENTITY,
             {
                 **base_command_input(),
-                "secretRef": "secret_001",
+                "providerAccess": {"source": "byo", "secretRef": "secret_001"},
             },
         )
 
-        self.assertEqual(observed_provider_request["providerAccess"], {"source": "byo", "secretRef": "secret_001"})
+        self.assertEqual(
+            observed_provider_request["providerAccess"],
+            {
+                "source": "byo",
+                "secretRef": "secret_001",
+                "tenantId": IDENTITY["tenantId"],
+                "userId": IDENTITY["userId"],
+            },
+        )
         self.assertNotIn("credential", observed_provider_request)
+
+    async def test_platform_provider_access_requires_quota_and_audit_before_generation(self) -> None:
+        events = []
+
+        class Provider:
+            calls = 0
+
+            async def stream(self, _request):
+                self.calls += 1
+                yield {"type": "assistant.final", "finishReason": "stop"}
+
+        provider = Provider()
+        service = create_command_service(
+            clock=lambda: NOW,
+            policy_service=SimplePolicy({"decision": "ALLOW", "decisionId": "pol_provider_access"}),
+            context_service=SimpleContext({"authorized": True}),
+            provider_registry={"openai": provider},
+            prompt_builder=SimplePromptBuilder(),
+            event_publisher=Publisher(events),
+        )
+        command = {
+            **base_command_input(),
+            "providerAccess": {"source": "platform", "reference": "platform_ref_001"},
+        }
+
+        with self.assertRaises(OrchestrationError) as caught:
+            await service.run_assistant_command(IDENTITY, command)
+
+        self.assertEqual(caught.exception.code, "PROVIDER_ACCESS_QUOTA_NOT_READY")
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual([event["type"] for event in events], ["progress", "progress", "error"])
+        self.assertEqual(events[-1]["errorCode"], "PROVIDER_ACCESS_QUOTA_NOT_READY")
+        self.assertEqual(events[-1]["metadata"]["provider"], "openai")
+        self.assertNotIn("platform_ref_001", str(events[-1]))
 
     async def test_provider_proposal_output_creates_server_owned_actions_and_safe_events(self) -> None:
         events = []

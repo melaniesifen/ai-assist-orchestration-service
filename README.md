@@ -29,6 +29,14 @@ The package-level dogfood handler wires proposed-action routes to the real actio
 
 Production provider, context, connector, event, persistence, and encryption adapters should implement the injected dependency contracts without logging raw prompts, document text, model responses, secrets, or decrypted action payloads. Durable AWS storage and real cross-service clients are still supplied outside this package.
 
+For M11 multi-user trusted dev, platform provider access must include
+metadata-only quota and audit decisions before provider generation starts. The
+command path fails closed when quota/audit readiness is missing or denied.
+BYO provider access remains available only through explicit
+`providerAccess.source = "byo"` handoff, and orchestration scopes that handoff
+with the derived tenant/user identity before any secrets-service boundary can
+decrypt a `SessionSecret`.
+
 Proposed action IDs and expirations are server-owned. Callers may request a shorter TTL with `ttlMs`, but actions are capped at the 24-hour MVP maximum.
 
 ## Package Layout

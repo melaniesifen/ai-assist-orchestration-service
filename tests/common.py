@@ -87,7 +87,12 @@ def base_command_input():
         "provider": "openai",
         "resourceId": "doc_001",
         "contextMode": "SELECTION",
-        "secretRef": "secret_ref_001",
+        "providerAccess": {
+            "source": "platform",
+            "reference": "platform_ref_001",
+            "quotaDecision": {"decision": "allow", "status": "ready"},
+            "auditDecision": {"decision": "recorded", "status": "ready"},
+        },
     }
 
 
