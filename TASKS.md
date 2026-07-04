@@ -61,6 +61,7 @@ Relevant LLDs:
 - [ ] EVT-001: Add the HTTP command API adapter for command creation, action approval/rejection, and apply-action with server-derived identity, request IDs, correlation IDs, and idempotency keys.
   - [x] Add repo-local, framework-neutral Python HTTP boundary DTOs/adapters for command creation, action approval, action rejection, and apply-action.
   - [x] Add a dependency-free stdlib HTTP runtime wrapper for canonical command, approve, reject, and apply-action route shapes.
+  - [x] Add deployed package-level dogfood handler for orchestration-owned command/action/apply routes with no-store safe JSON responses and explicit missing-dependency errors.
   - [x] Require trusted upstream auth context headers at the runtime boundary and reject path/body session or action mismatches before domain calls.
   - [x] Propagate request IDs and correlation IDs from the HTTP boundary into action status events.
   - [x] Require an idempotency key for command creation and apply-action at the HTTP boundary.
