@@ -159,6 +159,9 @@ class CommandService:
             "prompt": prompt,
             "context": context,
             "providerAccess": provider_access,
+            "tenantId": identity["tenantId"],
+            "userId": identity["userId"],
+            "sessionId": session_id,
             "requestId": request_id,
             "correlationId": correlation_id,
         }

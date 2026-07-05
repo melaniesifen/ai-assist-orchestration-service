@@ -70,6 +70,12 @@ Relevant LLDs:
   actions, approve/reject/apply routes, consent grants, and provider access
   cannot cross tenant/user boundaries.
 
+## Milestone 12 Provider-Backed Summarize
+
+- [x] M12-T7: Include server-derived tenant, user, and session metadata in the
+  injected provider request so the dogfood runtime can enforce owner-only
+  platform provider access without trusting browser-supplied identity.
+
 ## Architecture Tasks Pending
 
 - Approved direction: migrate from the temporary Node.js ESM bootstrap to Python initially. Revisit Java only if long-running workflow throughput or typed domain needs justify it.
